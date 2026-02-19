@@ -1,0 +1,516 @@
+# H2_SamViT.gizmo
+# SAM3 + ViTMatte AI Segmentation and Matting Gizmo for Nuke
+# Version 1.0.0
+
+Gizmo {
+ name H2_SamViT
+ tile_color 0x1f1f1fff
+ note_font "Verdana Bold"
+ mapsize {0.15 0.15}
+ addUserKnob {20 Node l "H2 SamViT"}
+
+ # ========== Text Detection Section ==========
+ addUserKnob {20 text_detection_grp l "Text Detection" n 1}
+
+ addUserKnob {4 pipeline_mode l "Pipeline Mode" M {"Point / Bbox" "Text Prompt"}}
+ pipeline_mode "Point / Bbox"
+
+ addUserKnob {1 text_prompt l "Text Prompt" +HIDDEN}
+ text_prompt ""
+
+ addUserKnob {22 run_inference l "Run Inference" T "from H2_SamViT_Gizmo import callbacks; callbacks.run_inference(nuke.thisNode())" +STARTLINE}
+
+ addUserKnob {20 endGroup_text_detection l endGroup n -1}
+
+ # ========== Tools Section ==========
+ addUserKnob {20 tools_grp l "Tools" n 1}
+
+ addUserKnob {6 enable_edit l "Enable Edit" +STARTLINE}
+ enable_edit true
+
+ addUserKnob {6 draw_box l "Draw Box" +STARTLINE}
+ draw_box true
+
+ addUserKnob {6 add_fg_point l "Add FG Point" +STARTLINE}
+ add_fg_point false
+
+ addUserKnob {6 add_bg_point l "Add BG Point" +STARTLINE}
+ add_bg_point false
+
+ addUserKnob {22 clear_all_points l "Clear All Points" T "from H2_SamViT_Gizmo import callbacks; callbacks.clear_all_points(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 clear_box l "Clear Box" T "from H2_SamViT_Gizmo import callbacks; callbacks.clear_box(nuke.thisNode())" +STARTLINE}
+
+ addUserKnob {20 endGroup_tools l endGroup n -1}
+
+ # ========== Points List Section ==========
+ addUserKnob {20 points_list_grp l "Points List" n 1}
+ points_list_grp 0
+
+ addUserKnob {20 point_01_grp l "Point 1" n 1}
+ point_01_grp 0
+ addUserKnob {12 point_01 l "Position"}
+ point_01 {0 0}
+ addUserKnob {6 point_01_fg l "FG" -STARTLINE}
+ point_01_fg true
+ addUserKnob {6 point_01_enabled l "On" -STARTLINE}
+ point_01_enabled false
+ addUserKnob {20 endGroup_point_01 l endGroup n -1}
+
+ addUserKnob {20 point_02_grp l "Point 2" n 1}
+ point_02_grp 0
+ addUserKnob {12 point_02 l "Position"}
+ point_02 {0 0}
+ addUserKnob {6 point_02_fg l "FG" -STARTLINE}
+ point_02_fg true
+ addUserKnob {6 point_02_enabled l "On" -STARTLINE}
+ point_02_enabled false
+ addUserKnob {20 endGroup_point_02 l endGroup n -1}
+
+ addUserKnob {20 point_03_grp l "Point 3" n 1}
+ point_03_grp 0
+ addUserKnob {12 point_03 l "Position"}
+ point_03 {0 0}
+ addUserKnob {6 point_03_fg l "FG" -STARTLINE}
+ point_03_fg true
+ addUserKnob {6 point_03_enabled l "On" -STARTLINE}
+ point_03_enabled false
+ addUserKnob {20 endGroup_point_03 l endGroup n -1}
+
+ addUserKnob {20 point_04_grp l "Point 4" n 1}
+ point_04_grp 0
+ addUserKnob {12 point_04 l "Position"}
+ point_04 {0 0}
+ addUserKnob {6 point_04_fg l "FG" -STARTLINE}
+ point_04_fg true
+ addUserKnob {6 point_04_enabled l "On" -STARTLINE}
+ point_04_enabled false
+ addUserKnob {20 endGroup_point_04 l endGroup n -1}
+
+ addUserKnob {20 point_05_grp l "Point 5" n 1}
+ point_05_grp 0
+ addUserKnob {12 point_05 l "Position"}
+ point_05 {0 0}
+ addUserKnob {6 point_05_fg l "FG" -STARTLINE}
+ point_05_fg true
+ addUserKnob {6 point_05_enabled l "On" -STARTLINE}
+ point_05_enabled false
+ addUserKnob {20 endGroup_point_05 l endGroup n -1}
+
+ addUserKnob {20 point_06_grp l "Point 6" n 1}
+ point_06_grp 0
+ addUserKnob {12 point_06 l "Position"}
+ point_06 {0 0}
+ addUserKnob {6 point_06_fg l "FG" -STARTLINE}
+ point_06_fg true
+ addUserKnob {6 point_06_enabled l "On" -STARTLINE}
+ point_06_enabled false
+ addUserKnob {20 endGroup_point_06 l endGroup n -1}
+
+ addUserKnob {20 point_07_grp l "Point 7" n 1}
+ point_07_grp 0
+ addUserKnob {12 point_07 l "Position"}
+ point_07 {0 0}
+ addUserKnob {6 point_07_fg l "FG" -STARTLINE}
+ point_07_fg true
+ addUserKnob {6 point_07_enabled l "On" -STARTLINE}
+ point_07_enabled false
+ addUserKnob {20 endGroup_point_07 l endGroup n -1}
+
+ addUserKnob {20 point_08_grp l "Point 8" n 1}
+ point_08_grp 0
+ addUserKnob {12 point_08 l "Position"}
+ point_08 {0 0}
+ addUserKnob {6 point_08_fg l "FG" -STARTLINE}
+ point_08_fg true
+ addUserKnob {6 point_08_enabled l "On" -STARTLINE}
+ point_08_enabled false
+ addUserKnob {20 endGroup_point_08 l endGroup n -1}
+
+ addUserKnob {20 point_09_grp l "Point 9" n 1}
+ point_09_grp 0
+ addUserKnob {12 point_09 l "Position"}
+ point_09 {0 0}
+ addUserKnob {6 point_09_fg l "FG" -STARTLINE}
+ point_09_fg true
+ addUserKnob {6 point_09_enabled l "On" -STARTLINE}
+ point_09_enabled false
+ addUserKnob {20 endGroup_point_09 l endGroup n -1}
+
+ addUserKnob {20 point_10_grp l "Point 10" n 1}
+ point_10_grp 0
+ addUserKnob {12 point_10 l "Position"}
+ point_10 {0 0}
+ addUserKnob {6 point_10_fg l "FG" -STARTLINE}
+ point_10_fg true
+ addUserKnob {6 point_10_enabled l "On" -STARTLINE}
+ point_10_enabled false
+ addUserKnob {20 endGroup_point_10 l endGroup n -1}
+
+ addUserKnob {20 point_11_grp l "Point 11" n 1}
+ point_11_grp 0
+ addUserKnob {12 point_11 l "Position"}
+ point_11 {0 0}
+ addUserKnob {6 point_11_fg l "FG" -STARTLINE}
+ point_11_fg true
+ addUserKnob {6 point_11_enabled l "On" -STARTLINE}
+ point_11_enabled false
+ addUserKnob {20 endGroup_point_11 l endGroup n -1}
+
+ addUserKnob {20 point_12_grp l "Point 12" n 1}
+ point_12_grp 0
+ addUserKnob {12 point_12 l "Position"}
+ point_12 {0 0}
+ addUserKnob {6 point_12_fg l "FG" -STARTLINE}
+ point_12_fg true
+ addUserKnob {6 point_12_enabled l "On" -STARTLINE}
+ point_12_enabled false
+ addUserKnob {20 endGroup_point_12 l endGroup n -1}
+
+ addUserKnob {20 point_13_grp l "Point 13" n 1}
+ point_13_grp 0
+ addUserKnob {12 point_13 l "Position"}
+ point_13 {0 0}
+ addUserKnob {6 point_13_fg l "FG" -STARTLINE}
+ point_13_fg true
+ addUserKnob {6 point_13_enabled l "On" -STARTLINE}
+ point_13_enabled false
+ addUserKnob {20 endGroup_point_13 l endGroup n -1}
+
+ addUserKnob {20 point_14_grp l "Point 14" n 1}
+ point_14_grp 0
+ addUserKnob {12 point_14 l "Position"}
+ point_14 {0 0}
+ addUserKnob {6 point_14_fg l "FG" -STARTLINE}
+ point_14_fg true
+ addUserKnob {6 point_14_enabled l "On" -STARTLINE}
+ point_14_enabled false
+ addUserKnob {20 endGroup_point_14 l endGroup n -1}
+
+ addUserKnob {20 point_15_grp l "Point 15" n 1}
+ point_15_grp 0
+ addUserKnob {12 point_15 l "Position"}
+ point_15 {0 0}
+ addUserKnob {6 point_15_fg l "FG" -STARTLINE}
+ point_15_fg true
+ addUserKnob {6 point_15_enabled l "On" -STARTLINE}
+ point_15_enabled false
+ addUserKnob {20 endGroup_point_15 l endGroup n -1}
+
+ addUserKnob {20 point_16_grp l "Point 16" n 1}
+ point_16_grp 0
+ addUserKnob {12 point_16 l "Position"}
+ point_16 {0 0}
+ addUserKnob {6 point_16_fg l "FG" -STARTLINE}
+ point_16_fg true
+ addUserKnob {6 point_16_enabled l "On" -STARTLINE}
+ point_16_enabled false
+ addUserKnob {20 endGroup_point_16 l endGroup n -1}
+
+ addUserKnob {20 point_17_grp l "Point 17" n 1}
+ point_17_grp 0
+ addUserKnob {12 point_17 l "Position"}
+ point_17 {0 0}
+ addUserKnob {6 point_17_fg l "FG" -STARTLINE}
+ point_17_fg true
+ addUserKnob {6 point_17_enabled l "On" -STARTLINE}
+ point_17_enabled false
+ addUserKnob {20 endGroup_point_17 l endGroup n -1}
+
+ addUserKnob {20 point_18_grp l "Point 18" n 1}
+ point_18_grp 0
+ addUserKnob {12 point_18 l "Position"}
+ point_18 {0 0}
+ addUserKnob {6 point_18_fg l "FG" -STARTLINE}
+ point_18_fg true
+ addUserKnob {6 point_18_enabled l "On" -STARTLINE}
+ point_18_enabled false
+ addUserKnob {20 endGroup_point_18 l endGroup n -1}
+
+ addUserKnob {20 point_19_grp l "Point 19" n 1}
+ point_19_grp 0
+ addUserKnob {12 point_19 l "Position"}
+ point_19 {0 0}
+ addUserKnob {6 point_19_fg l "FG" -STARTLINE}
+ point_19_fg true
+ addUserKnob {6 point_19_enabled l "On" -STARTLINE}
+ point_19_enabled false
+ addUserKnob {20 endGroup_point_19 l endGroup n -1}
+
+ addUserKnob {20 point_20_grp l "Point 20" n 1}
+ point_20_grp 0
+ addUserKnob {12 point_20 l "Position"}
+ point_20 {0 0}
+ addUserKnob {6 point_20_fg l "FG" -STARTLINE}
+ point_20_fg true
+ addUserKnob {6 point_20_enabled l "On" -STARTLINE}
+ point_20_enabled false
+ addUserKnob {20 endGroup_point_20 l endGroup n -1}
+
+ addUserKnob {20 point_21_grp l "Point 21" n 1}
+ point_21_grp 0
+ addUserKnob {12 point_21 l "Position"}
+ point_21 {0 0}
+ addUserKnob {6 point_21_fg l "FG" -STARTLINE}
+ point_21_fg true
+ addUserKnob {6 point_21_enabled l "On" -STARTLINE}
+ point_21_enabled false
+ addUserKnob {20 endGroup_point_21 l endGroup n -1}
+
+ addUserKnob {20 point_22_grp l "Point 22" n 1}
+ point_22_grp 0
+ addUserKnob {12 point_22 l "Position"}
+ point_22 {0 0}
+ addUserKnob {6 point_22_fg l "FG" -STARTLINE}
+ point_22_fg true
+ addUserKnob {6 point_22_enabled l "On" -STARTLINE}
+ point_22_enabled false
+ addUserKnob {20 endGroup_point_22 l endGroup n -1}
+
+ addUserKnob {20 point_23_grp l "Point 23" n 1}
+ point_23_grp 0
+ addUserKnob {12 point_23 l "Position"}
+ point_23 {0 0}
+ addUserKnob {6 point_23_fg l "FG" -STARTLINE}
+ point_23_fg true
+ addUserKnob {6 point_23_enabled l "On" -STARTLINE}
+ point_23_enabled false
+ addUserKnob {20 endGroup_point_23 l endGroup n -1}
+
+ addUserKnob {20 point_24_grp l "Point 24" n 1}
+ point_24_grp 0
+ addUserKnob {12 point_24 l "Position"}
+ point_24 {0 0}
+ addUserKnob {6 point_24_fg l "FG" -STARTLINE}
+ point_24_fg true
+ addUserKnob {6 point_24_enabled l "On" -STARTLINE}
+ point_24_enabled false
+ addUserKnob {20 endGroup_point_24 l endGroup n -1}
+
+ addUserKnob {20 point_25_grp l "Point 25" n 1}
+ point_25_grp 0
+ addUserKnob {12 point_25 l "Position"}
+ point_25 {0 0}
+ addUserKnob {6 point_25_fg l "FG" -STARTLINE}
+ point_25_fg true
+ addUserKnob {6 point_25_enabled l "On" -STARTLINE}
+ point_25_enabled false
+ addUserKnob {20 endGroup_point_25 l endGroup n -1}
+
+ addUserKnob {20 point_26_grp l "Point 26" n 1}
+ point_26_grp 0
+ addUserKnob {12 point_26 l "Position"}
+ point_26 {0 0}
+ addUserKnob {6 point_26_fg l "FG" -STARTLINE}
+ point_26_fg true
+ addUserKnob {6 point_26_enabled l "On" -STARTLINE}
+ point_26_enabled false
+ addUserKnob {20 endGroup_point_26 l endGroup n -1}
+
+ addUserKnob {20 point_27_grp l "Point 27" n 1}
+ point_27_grp 0
+ addUserKnob {12 point_27 l "Position"}
+ point_27 {0 0}
+ addUserKnob {6 point_27_fg l "FG" -STARTLINE}
+ point_27_fg true
+ addUserKnob {6 point_27_enabled l "On" -STARTLINE}
+ point_27_enabled false
+ addUserKnob {20 endGroup_point_27 l endGroup n -1}
+
+ addUserKnob {20 point_28_grp l "Point 28" n 1}
+ point_28_grp 0
+ addUserKnob {12 point_28 l "Position"}
+ point_28 {0 0}
+ addUserKnob {6 point_28_fg l "FG" -STARTLINE}
+ point_28_fg true
+ addUserKnob {6 point_28_enabled l "On" -STARTLINE}
+ point_28_enabled false
+ addUserKnob {20 endGroup_point_28 l endGroup n -1}
+
+ addUserKnob {20 point_29_grp l "Point 29" n 1}
+ point_29_grp 0
+ addUserKnob {12 point_29 l "Position"}
+ point_29 {0 0}
+ addUserKnob {6 point_29_fg l "FG" -STARTLINE}
+ point_29_fg true
+ addUserKnob {6 point_29_enabled l "On" -STARTLINE}
+ point_29_enabled false
+ addUserKnob {20 endGroup_point_29 l endGroup n -1}
+
+ addUserKnob {20 point_30_grp l "Point 30" n 1}
+ point_30_grp 0
+ addUserKnob {12 point_30 l "Position"}
+ point_30 {0 0}
+ addUserKnob {6 point_30_fg l "FG" -STARTLINE}
+ point_30_fg true
+ addUserKnob {6 point_30_enabled l "On" -STARTLINE}
+ point_30_enabled false
+ addUserKnob {20 endGroup_point_30 l endGroup n -1}
+
+ addUserKnob {20 point_31_grp l "Point 31" n 1}
+ point_31_grp 0
+ addUserKnob {12 point_31 l "Position"}
+ point_31 {0 0}
+ addUserKnob {6 point_31_fg l "FG" -STARTLINE}
+ point_31_fg true
+ addUserKnob {6 point_31_enabled l "On" -STARTLINE}
+ point_31_enabled false
+ addUserKnob {20 endGroup_point_31 l endGroup n -1}
+
+ addUserKnob {20 point_32_grp l "Point 32" n 1}
+ point_32_grp 0
+ addUserKnob {12 point_32 l "Position"}
+ point_32 {0 0}
+ addUserKnob {6 point_32_fg l "FG" -STARTLINE}
+ point_32_fg true
+ addUserKnob {6 point_32_enabled l "On" -STARTLINE}
+ point_32_enabled false
+ addUserKnob {20 endGroup_point_32 l endGroup n -1}
+
+ addUserKnob {20 endGroup_points_list l endGroup n -1}
+
+ # ========== Bounding Box Section ==========
+ addUserKnob {20 bounding_box_grp l "Bounding Box" n 1}
+ bounding_box_grp 0
+
+ addUserKnob {12 bbox_top_left l "Top Left"}
+ bbox_top_left {0 0}
+
+ addUserKnob {12 bbox_bottom_right l "Bottom Right"}
+ bbox_bottom_right {0 0}
+
+ addUserKnob {7 bbox_enabled l "Enabled 1/0" R 0 1}
+ bbox_enabled 0
+
+ addUserKnob {20 endGroup_bbox l endGroup n -1}
+
+ # ========== UI Appearance Section ==========
+ addUserKnob {20 ui_appearance_grp l "UI Appearance" n 1}
+
+ addUserKnob {6 show_ui_overlays l "Show / Hide" +STARTLINE}
+ show_ui_overlays true
+
+ addUserKnob {6 show_point_labels l "Show Point Labels" +STARTLINE}
+ show_point_labels true
+
+ addUserKnob {19 ui_color l "Points & Bbox Color"}
+ ui_color {0 0.652 1 0.8}
+ addUserKnob {6 ui_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+
+ addUserKnob {7 overlay_scale l "Overlay Scale" R 0.5 2}
+ overlay_scale 1.0
+
+ addUserKnob {20 endGroup_ui l endGroup n -1}
+
+ # ========== Pre Processing Section ==========
+ addUserKnob {20 pre_processing_grp l "Pre Processing" n 1}
+ pre_processing_grp 0
+
+ addUserKnob {7 input_threshold l "Binary Threshold" R 0 255}
+ input_threshold 90
+
+ addUserKnob {6 fill_holes l "Fill Holes" +STARTLINE}
+ fill_holes true
+
+ addUserKnob {7 fill_holes_area l "Fill Holes Area" R 0 32}
+ fill_holes_area 16
+
+ addUserKnob {7 crop_padding l "Crop Padding %" R 0 50}
+ crop_padding 20
+
+ addUserKnob {20 endGroup_preproc l endGroup n -1}
+
+ # ========== Mask Post-Processing Section ==========
+ addUserKnob {20 mask_post_processing_grp l "Mask Post-Processing" n 1}
+ mask_post_processing_grp 0
+
+ addUserKnob {4 display_mode l "Display Mode" M {"Matte" "Overlay"}}
+ display_mode "Overlay"
+
+ addUserKnob {6 show_mask_overlay l "Show Mask Overlay" +STARTLINE}
+ show_mask_overlay true
+
+ addUserKnob {19 overlay_color l "Overlay Color"}
+ overlay_color {0.5 0 0 0.5}
+ addUserKnob {6 overlay_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+
+ addUserKnob {7 mask_shrink_grow l "Mask Shrink/Grow" R -50 50}
+ mask_shrink_grow 0
+
+ addUserKnob {7 edge_feather l "Edge Feather" R 0 100}
+ edge_feather 0
+
+ addUserKnob {7 offset_mask_x l "Offset Mask X" R -100 100}
+ offset_mask_x 0
+
+ addUserKnob {7 offset_mask_y l "Offset Mask Y" R -100 100}
+ offset_mask_y 0
+
+ addUserKnob {7 refiner_trimap_width l "Refiner Trimap Width" R 0 50}
+ refiner_trimap_width 10
+
+ addUserKnob {7 trimap_erode_radius l "Trimap Erode Radius" R 0 20}
+ trimap_erode_radius 2
+
+ addUserKnob {7 trimap_dilate_radius l "Trimap Dilate Radius" R 0 20}
+ trimap_dilate_radius 2
+
+ addUserKnob {6 final_binary_sharp l "Final Binary Sharp" +STARTLINE}
+ final_binary_sharp false
+
+ addUserKnob {20 endGroup_mask_post l endGroup n -1}
+
+ # ========== Temporal Mask Consistency Section ==========
+ addUserKnob {20 temporal_consistency_grp l "Temporal Mask Consistency" n 1}
+ temporal_consistency_grp 0
+
+ addUserKnob {6 enable_temporal_consistency l "Enable Temporal Consistency" +STARTLINE}
+ enable_temporal_consistency true
+
+ addUserKnob {7 temporal_weight l "Temporal Weight (%)" R 0 100}
+ temporal_weight 50
+
+ addUserKnob {7 suppression_threshold l "Suppression Threshold (%)" R 0 100}
+ suppression_threshold 30
+
+ addUserKnob {20 endGroup_temporal_consistency l endGroup n -1}
+
+ # ========== Temporal Smoothing Motion Section ==========
+ addUserKnob {20 temporal_smoothing_grp l "Temporal Smoothing Motion" n 1}
+ temporal_smoothing_grp 0
+
+ addUserKnob {6 enable_temporal l "Enable Temporal" +STARTLINE}
+ enable_temporal false
+
+ addUserKnob {7 temporal_smoothing l "Smoothing" R 0 100}
+ temporal_smoothing 50
+
+ addUserKnob {6 smooth_edges_only l "Smooth edges only" +STARTLINE}
+ smooth_edges_only false
+
+ addUserKnob {7 edge_width l "Edge width" R 3 30}
+ edge_width 8
+
+ addUserKnob {20 endGroup_temporal_smoothing l endGroup n -1}
+
+ # ========== Reset All Parameters ==========
+ addUserKnob {22 reset_all_parameters l "Reset All Parameters" T "from H2_SamViT_Gizmo import callbacks; callbacks.reset_all_parameters(nuke.thisNode())" +STARTLINE}
+
+ # ========== Cache Memory Section ==========
+ addUserKnob {20 cache_memory_grp l "Cache Memory" n 1}
+ cache_memory_grp 0
+
+ addUserKnob {7 cache_memory_percent l "Cache Memory %" R 10 75}
+ cache_memory_percent 25
+
+ addUserKnob {26 cache_limit l "Cache Limit" T "17.9 GB"}
+
+ addUserKnob {20 endGroup_cache l endGroup n -1}
+
+ # ========== License Section ==========
+ addUserKnob {20 license_grp l "License" n 1}
+ license_grp 0
+
+ addUserKnob {26 license_text l "" +STARTLINE T "H2 SamViT v1.0\nSAM3 + ViTMatte\n\u00a9 2026 H2 Studios"}
+
+ addUserKnob {20 endGroup_license l endGroup n -1}
+}
