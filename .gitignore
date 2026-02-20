@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+models/vitmatte/
+models/grounding_dino/
+env_config.json
+*.tmp
+*.bak

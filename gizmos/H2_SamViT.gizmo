@@ -1,16 +1,32 @@
-# H2_SamViT.gizmo
-# SAM3 + ViTMatte AI Segmentation and Matting Gizmo for Nuke
-# Version 1.0.0
-
 Gizmo {
+ inputs 1
  name H2_SamViT
  tile_color 0x1f1f1fff
  note_font "Verdana Bold"
  mapsize {0.15 0.15}
- addUserKnob {20 Node l "H2 SamViT"}
+ onCreate "try:\n from H2_SamViT_Gizmo import callbacks\n callbacks.on_create(nuke.thisNode())\nexcept:\n pass"
+ knobChanged "try:\n from H2_SamViT_Gizmo import callbacks\n callbacks.on_knob_changed(nuke.thisNode(), nuke.thisKnob())\nexcept:\n pass"
+ addUserKnob {20 main_tab l "H2 SamViT"}
 
- # ========== Text Detection Section ==========
- addUserKnob {20 text_detection_grp l "Text Detection" n 1}
+ addUserKnob {20 model_grp l "Model" n 1}
+
+ addUserKnob {4 model_family l "Model Family" M {"SAM2" "SAM3"}}
+ model_family "SAM2"
+
+ addUserKnob {4 sam_version l "SAM Version" M {"2.0" "2.1"}}
+ sam_version "2.1"
+
+ addUserKnob {4 model_size l "Model Size" M {"Tiny" "Small" "Base+" "Large"}}
+ model_size "Large"
+
+ addUserKnob {4 model_precision l "Precision" M {"fp16" "bf16" "fp32"}}
+ model_precision "fp16"
+
+ addUserKnob {22 download_model l "Download Model" T "from H2_SamViT_Gizmo import callbacks; callbacks.download_model_action(nuke.thisNode())" +STARTLINE}
+
+ addUserKnob {26 model_status l "Status" T "Not downloaded"}
+
+ addUserKnob {20 endGroup_model l endGroup n -1}
 
  addUserKnob {4 pipeline_mode l "Pipeline Mode" M {"Point / Bbox" "Text Prompt"}}
  pipeline_mode "Point / Bbox"
@@ -18,18 +34,16 @@ Gizmo {
  addUserKnob {1 text_prompt l "Text Prompt" +HIDDEN}
  text_prompt ""
 
+ addUserKnob {26 div_run l "" +STARTLINE}
  addUserKnob {22 run_inference l "Run Inference" T "from H2_SamViT_Gizmo import callbacks; callbacks.run_inference(nuke.thisNode())" +STARTLINE}
 
- addUserKnob {20 endGroup_text_detection l endGroup n -1}
-
- # ========== Tools Section ==========
  addUserKnob {20 tools_grp l "Tools" n 1}
 
  addUserKnob {6 enable_edit l "Enable Edit" +STARTLINE}
  enable_edit true
 
  addUserKnob {6 draw_box l "Draw Box" +STARTLINE}
- draw_box true
+ draw_box false
 
  addUserKnob {6 add_fg_point l "Add FG Point" +STARTLINE}
  add_fg_point false
@@ -42,7 +56,6 @@ Gizmo {
 
  addUserKnob {20 endGroup_tools l endGroup n -1}
 
- # ========== Points List Section ==========
  addUserKnob {20 points_list_grp l "Points List" n 1}
  points_list_grp 0
 
@@ -368,7 +381,6 @@ Gizmo {
 
  addUserKnob {20 endGroup_points_list l endGroup n -1}
 
- # ========== Bounding Box Section ==========
  addUserKnob {20 bounding_box_grp l "Bounding Box" n 1}
  bounding_box_grp 0
 
@@ -383,30 +395,44 @@ Gizmo {
 
  addUserKnob {20 endGroup_bbox l endGroup n -1}
 
- # ========== UI Appearance Section ==========
  addUserKnob {20 ui_appearance_grp l "UI Appearance" n 1}
 
- addUserKnob {6 show_ui_overlays l "Show / Hide" +STARTLINE}
+ addUserKnob {26 shortcut_info l "" +STARTLINE T "<b>Viewer Shortcuts</b> (node must be selected):\n  Ctrl + Left Click  =  FG point (positive)\n  Ctrl + Right Click =  BG point (negative)\n  Shift + Left Drag  =  Bounding Box"}
+
+ addUserKnob {6 show_ui_overlays l "Show / Hide Guides" +STARTLINE}
  show_ui_overlays true
 
  addUserKnob {6 show_point_labels l "Show Point Labels" +STARTLINE}
  show_point_labels true
 
- addUserKnob {19 ui_color l "Points & Bbox Color"}
- ui_color {0 0.652 1 0.8}
- addUserKnob {6 ui_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {18 fg_point_color l "FG Point Color"}
+ fg_point_color {0 1 0}
+ addUserKnob {6 fg_point_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+
+ addUserKnob {18 bg_point_color l "BG Point Color"}
+ bg_point_color {1 0 0}
+ addUserKnob {6 bg_point_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+
+ addUserKnob {18 bbox_color l "Bbox Color"}
+ bbox_color {0 0.65 1}
+ addUserKnob {6 bbox_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
 
  addUserKnob {7 overlay_scale l "Overlay Scale" R 0.5 2}
  overlay_scale 1.0
 
  addUserKnob {20 endGroup_ui l endGroup n -1}
 
- # ========== Pre Processing Section ==========
  addUserKnob {20 pre_processing_grp l "Pre Processing" n 1}
  pre_processing_grp 0
 
  addUserKnob {7 input_threshold l "Binary Threshold" R 0 255}
- input_threshold 90
+ input_threshold 100
+
+ addUserKnob {7 black_point l "Black Point" R 0 1}
+ black_point 0
+
+ addUserKnob {7 white_point l "White Point" R 0 1}
+ white_point 1
 
  addUserKnob {6 fill_holes l "Fill Holes" +STARTLINE}
  fill_holes true
@@ -419,9 +445,27 @@ Gizmo {
 
  addUserKnob {20 endGroup_preproc l endGroup n -1}
 
- # ========== Mask Post-Processing Section ==========
- addUserKnob {20 mask_post_processing_grp l "Mask Post-Processing" n 1}
- mask_post_processing_grp 0
+ addUserKnob {20 vitmatte_trimap_grp l "VitMatte Trimap" n 1}
+ vitmatte_trimap_grp 0
+
+ addUserKnob {6 show_trimap_overlay l "Show Trimap Overlay" +STARTLINE}
+ show_trimap_overlay false
+
+ addUserKnob {7 trimap_overlay_opacity l "Trimap Overlay Opacity" R 0 1}
+ trimap_overlay_opacity 0.6
+
+ addUserKnob {7 trimap_erode_radius l "Trimap Erode Radius" R 0 200}
+ trimap_erode_radius 3
+
+ addUserKnob {7 trimap_dilate_radius l "Trimap Dilate Radius" R 0 200}
+ trimap_dilate_radius 10
+
+ addUserKnob {20 endGroup_vitmatte l endGroup n -1}
+
+ addUserKnob {20 output_grp l "Output" n 1}
+
+ addUserKnob {4 output_alpha_mode l "Output Alpha Mode" M {"Straight" "Premultiplied"}}
+ output_alpha_mode "Straight"
 
  addUserKnob {4 display_mode l "Display Mode" M {"Matte" "Overlay"}}
  display_mode "Overlay"
@@ -445,21 +489,11 @@ Gizmo {
  addUserKnob {7 offset_mask_y l "Offset Mask Y" R -100 100}
  offset_mask_y 0
 
- addUserKnob {7 refiner_trimap_width l "Refiner Trimap Width" R 0 50}
- refiner_trimap_width 10
-
- addUserKnob {7 trimap_erode_radius l "Trimap Erode Radius" R 0 20}
- trimap_erode_radius 2
-
- addUserKnob {7 trimap_dilate_radius l "Trimap Dilate Radius" R 0 20}
- trimap_dilate_radius 2
-
  addUserKnob {6 final_binary_sharp l "Final Binary Sharp" +STARTLINE}
  final_binary_sharp false
 
- addUserKnob {20 endGroup_mask_post l endGroup n -1}
+ addUserKnob {20 endGroup_output l endGroup n -1}
 
- # ========== Temporal Mask Consistency Section ==========
  addUserKnob {20 temporal_consistency_grp l "Temporal Mask Consistency" n 1}
  temporal_consistency_grp 0
 
@@ -474,7 +508,6 @@ Gizmo {
 
  addUserKnob {20 endGroup_temporal_consistency l endGroup n -1}
 
- # ========== Temporal Smoothing Motion Section ==========
  addUserKnob {20 temporal_smoothing_grp l "Temporal Smoothing Motion" n 1}
  temporal_smoothing_grp 0
 
@@ -492,10 +525,8 @@ Gizmo {
 
  addUserKnob {20 endGroup_temporal_smoothing l endGroup n -1}
 
- # ========== Reset All Parameters ==========
  addUserKnob {22 reset_all_parameters l "Reset All Parameters" T "from H2_SamViT_Gizmo import callbacks; callbacks.reset_all_parameters(nuke.thisNode())" +STARTLINE}
 
- # ========== Cache Memory Section ==========
  addUserKnob {20 cache_memory_grp l "Cache Memory" n 1}
  cache_memory_grp 0
 
@@ -506,7 +537,6 @@ Gizmo {
 
  addUserKnob {20 endGroup_cache l endGroup n -1}
 
- # ========== License Section ==========
  addUserKnob {20 license_grp l "License" n 1}
  license_grp 0
 
@@ -514,3 +544,32 @@ Gizmo {
 
  addUserKnob {20 endGroup_license l endGroup n -1}
 }
+ Constant {
+  inputs 0
+  channels rgba
+  color {0 0 0 0}
+  name MaskSource
+  xpos 200
+  ypos -200
+ }
+ Input {
+  inputs 0
+  name Input1
+  xpos 0
+  ypos -200
+ }
+ Copy {
+  inputs 2
+  from0 rgba.red
+  to0 rgba.alpha
+  name CopyAlpha
+  xpos 0
+  ypos 0
+  disable true
+ }
+ Output {
+  name Output1
+  xpos 0
+  ypos 100
+ }
+end_group

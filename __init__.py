@@ -1,13 +1,12 @@
 # H2_SamViT_Gizmo - SAM3 + ViTMatte Gizmo for Nuke
 # Copyright (C) 2026
-# 
+#
 # A comprehensive AI-powered segmentation and matting gizmo combining
 # SAM3 (Segment Anything Model 3) with ViTMatte for high-quality alpha mattes.
 
 __version__ = "1.0.0"
 __author__ = "H2"
 
-import nuke
 import os
 
 # Get the directory where this package is installed
@@ -15,19 +14,49 @@ PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 GIZMO_DIR = os.path.join(PACKAGE_DIR, "gizmos")
 ICONS_DIR = os.path.join(PACKAGE_DIR, "icons")
 
+# ── Bootstrap the virtual-environment packages into Nuke's Python ──
+# This MUST happen before anything tries to import torch / transformers.
+try:
+    from . import env_bootstrap
+    _env_ok = env_bootstrap.bootstrap(verbose=True)
+    if _env_ok:
+        env_bootstrap.check_packages(verbose=True)
+    else:
+        print("[H2_SamViT_Gizmo] ML packages unavailable — run install.py first.")
+except Exception as _exc:
+    print(f"[H2_SamViT_Gizmo] env_bootstrap failed: {_exc}")
+    _env_ok = False
+
+# ── Nuke registration ──
+try:
+    import nuke
+    _IN_NUKE = True
+except ImportError:
+    _IN_NUKE = False
+
+
 def register():
     """Register the gizmo with Nuke."""
-    # Add gizmo path
+    if not _IN_NUKE:
+        return
+
     nuke.pluginAddPath(GIZMO_DIR)
-    
-    # Add icons path
+
     if os.path.exists(ICONS_DIR):
         nuke.pluginAddPath(ICONS_DIR)
-    
-    # Import callbacks to register knob changed handlers
-    from . import callbacks
-    
+
+    # Register knob-changed handlers
+    from . import callbacks  # noqa: F811
+
+    # Install interactive viewer overlay (Ctrl+click, Shift+drag)
+    try:
+        from . import ui_overlay
+        ui_overlay.install()
+    except Exception as _ov_exc:
+        print(f"[H2_SamViT_Gizmo] Viewer overlay not installed: {_ov_exc}")
+
     print(f"[H2_SamViT_Gizmo] Registered v{__version__}")
+
 
 def unregister():
     """Unregister the gizmo from Nuke."""

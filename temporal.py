@@ -58,6 +58,11 @@ def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     # Binarize
     m1 = (mask1 > 0.5).astype(np.float32)
     m2 = (mask2 > 0.5).astype(np.float32)
+
+    # Resize if shapes differ (e.g. cached mask from a different resolution)
+    if m1.shape != m2.shape:
+        m2 = cv2.resize(m2, (m1.shape[1], m1.shape[0]),
+                        interpolation=cv2.INTER_NEAREST)
     
     intersection = np.sum(m1 * m2)
     union = np.sum(m1) + np.sum(m2) - intersection
@@ -128,6 +133,13 @@ def suppress_jumping_regions(
     """
     if previous_mask is None:
         return mask
+
+    # Resize previous mask to match current if resolutions differ
+    if previous_mask.shape != mask.shape:
+        previous_mask = cv2.resize(
+            previous_mask, (mask.shape[1], mask.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
     
     # Binarize masks
     current_binary = (mask > 0.5).astype(np.uint8)

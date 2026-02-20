@@ -1,9 +1,18 @@
 # vitmatte_refiner.py - High-quality alpha matte refinement using ViTMatte
-# Converts SAM3 coarse masks into production-quality alpha mattes
+# Converts SAM coarse masks into production-quality alpha mattes.
+# Model weights are cached locally inside models/vitmatte/ for portability.
 
+import os
 import numpy as np
+from pathlib import Path
 from typing import Tuple, Optional
 import cv2
+
+PACKAGE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+MODELS_DIR = PACKAGE_DIR / "models"
+VITMATTE_CACHE = MODELS_DIR / "vitmatte"
+
+_MODEL_NAME = "hustvl/vitmatte-small-composition-1k"
 
 
 class ViTMatteRefiner:
@@ -16,7 +25,12 @@ class ViTMatteRefiner:
         self._loaded = False
     
     def load(self):
-        """Load the ViTMatte model."""
+        """Load the ViTMatte model.
+
+        Weights are downloaded to ``models/vitmatte/`` on the first call
+        and loaded from there on subsequent calls — no reliance on the
+        default ``~/.cache/huggingface/`` directory.
+        """
         if self._loaded:
             return
         
@@ -32,11 +46,17 @@ class ViTMatteRefiner:
             self.device = torch.device("cpu")
         
         print(f"[ViTMatte] Loading model on {self.device}...")
-        
-        model_name = "hustvl/vitmatte-small-composition-1k"
-        
-        self.processor = VitMatteImageProcessor.from_pretrained(model_name)
-        self.model = VitMatteForImageMatting.from_pretrained(model_name)
+
+        # Ensure local cache directory exists
+        VITMATTE_CACHE.mkdir(parents=True, exist_ok=True)
+
+        cache_dir = str(VITMATTE_CACHE)
+        self.processor = VitMatteImageProcessor.from_pretrained(
+            _MODEL_NAME, cache_dir=cache_dir,
+        )
+        self.model = VitMatteForImageMatting.from_pretrained(
+            _MODEL_NAME, cache_dir=cache_dir,
+        )
         self.model.to(self.device)
         self.model.eval()
         
@@ -148,10 +168,23 @@ class ViTMatteRefiner:
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Run inference
-        with torch.no_grad():
+        # Run inference.
+        # SAM3's Sam3TrackerPredictor.__init__() enters a PERSISTENT
+        # bfloat16 autocast context that never exits.  This leaks into
+        # every subsequent torch operation — including ViTMatte.
+        # We explicitly disable autocast here so ViTMatte runs in its
+        # native float32 precision, then cast the output to float32
+        # before converting to numpy (which doesn't support bf16).
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"
+        with torch.no_grad(), torch.autocast(device_type=_dev, enabled=False):
+            # Re-cast inputs to float32 in case autocast already
+            # converted them before we disabled it.
+            inputs = {
+                k: v.float() if v.is_floating_point() else v
+                for k, v in inputs.items()
+            }
             outputs = self.model(**inputs)
-            alpha = outputs.alphas[0, 0].cpu().numpy()
+            alpha = outputs.alphas[0, 0].cpu().float().numpy()
         
         # Resize back to original size if needed
         if alpha.shape != coarse_mask.shape:
