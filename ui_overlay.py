@@ -1,563 +1,398 @@
-# ui_overlay.py  —  Interactive viewer overlay for H2 SamViT
+# ui_overlay.py  —  Viewer overlay for H2 SamViT
 #
-# Provides two capabilities:
+# Renders coloured point and bounding-box annotations into a transparent
+# PNG image and feeds it into the gizmo's internal **OverlaySource** node.
+# The gizmo's **OverlayMerge** (Merge2 / over / RGB-only) composites it
+# over the main image so the user sees green/red dots and a cyan bbox
+# directly in the Nuke Viewer — no fragile Qt overlay needed.
 #
-#   1.  **Viewer interaction** via a Qt event-filter on the GL viewport:
-#         • Ctrl + Left Click   → place FG point  (positive / green)
-#         • Ctrl + Right Click  → place BG point  (negative / red)
-#         • Shift + Left Drag   → draw bounding box
-#
-#   2.  **Coloured annotations** painted on a transparent overlay widget:
-#         • Green filled circles for FG points  (with + symbol)
-#         • Red   filled circles for BG points  (with – symbol)
-#         • Cyan  dashed rectangle for bounding box
-#         • Numeric labels next to each point
-#
-# The overlay is installed once (via ``install()``) and from then on
-# repaints automatically whenever the viewer refreshes.
+# Call ``render_overlay(node)`` whenever points, bbox, or appearance
+# knobs change.  Call ``clear_overlay(node)`` to remove the overlay.
 # ─────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
-import math
+import os
+import tempfile
 from typing import Optional, Tuple
-
-try:
-    from PySide6 import QtWidgets, QtCore, QtGui   # Nuke 16+
-except ImportError:
-    from PySide2 import QtWidgets, QtCore, QtGui   # Nuke 14-15
-
-# ── Enum compatibility (PySide6 strict-enum vs PySide2 flat enum) ──
-try:
-    from PySide6.QtCore import Qt
-    _ControlMod      = Qt.KeyboardModifier.ControlModifier
-    _ShiftMod         = Qt.KeyboardModifier.ShiftModifier
-    _LeftBtn          = Qt.MouseButton.LeftButton
-    _RightBtn         = Qt.MouseButton.RightButton
-    _NoPen            = Qt.PenStyle.NoPen
-    _DashLine         = Qt.PenStyle.DashLine
-    _DashDotLine      = Qt.PenStyle.DashDotLine
-    _WA_TransMouse    = Qt.WidgetAttribute.WA_TransparentForMouseEvents
-    _WA_TransBG       = Qt.WidgetAttribute.WA_TranslucentBackground
-    _Antialiasing     = QtGui.QPainter.RenderHint.Antialiasing
-    _MousePress       = QtCore.QEvent.Type.MouseButtonPress
-    _MouseRelease     = QtCore.QEvent.Type.MouseButtonRelease
-    _MouseMove        = QtCore.QEvent.Type.MouseMove
-except (ImportError, AttributeError):
-    from PySide2.QtCore import Qt                       # type: ignore[assignment]
-    _ControlMod      = Qt.ControlModifier               # type: ignore[attr-defined]
-    _ShiftMod         = Qt.ShiftModifier                 # type: ignore[attr-defined]
-    _LeftBtn          = Qt.LeftButton                    # type: ignore[attr-defined]
-    _RightBtn         = Qt.RightButton                   # type: ignore[attr-defined]
-    _NoPen            = Qt.NoPen                         # type: ignore[attr-defined]
-    _DashLine         = Qt.DashLine                      # type: ignore[attr-defined]
-    _DashDotLine      = Qt.DashDotLine                   # type: ignore[attr-defined]
-    _WA_TransMouse    = Qt.WA_TransparentForMouseEvents  # type: ignore[attr-defined]
-    _WA_TransBG       = Qt.WA_TranslucentBackground      # type: ignore[attr-defined]
-    _Antialiasing     = QtGui.QPainter.Antialiasing      # type: ignore[attr-defined]
-    _MousePress       = QtCore.QEvent.MouseButtonPress   # type: ignore[attr-defined]
-    _MouseRelease     = QtCore.QEvent.MouseButtonRelease # type: ignore[attr-defined]
-    _MouseMove        = QtCore.QEvent.MouseMove          # type: ignore[attr-defined]
 
 import nuke
 
-# ── Module-level state ──────────────────────────────────────────────
-_installed: bool = False
-_event_filter: Optional["_ViewerEventFilter"] = None
-_overlay_widget: Optional["_OverlayWidget"] = None
-_viewer_widget: Optional[QtWidgets.QWidget] = None
-_retry_timer: Optional[QtCore.QTimer] = None
-_retry_count: int = 0
+
+# Temp directory for overlay PNGs
+_OVERLAY_DIR = os.path.join(tempfile.gettempdir(), "h2_samvit_overlays")
+os.makedirs(_OVERLAY_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Helpers
+#  Colour helpers
 # ─────────────────────────────────────────────────────────────────────
 
-def _event_xy(event) -> Tuple[float, float]:
-    """Get (x, y) from a QMouseEvent — works in both PySide2 & 6."""
-    try:
-        p = event.position()          # PySide6 / Qt 6
-    except AttributeError:
-        p = event.pos()               # PySide2 / Qt 5
-    return float(p.x()), float(p.y())
-
-
-def _widget_to_image(widget: QtWidgets.QWidget,
-                     wx: float, wy: float
-                     ) -> Tuple[Optional[float], Optional[float]]:
-    """Convert widget pixel coords → Nuke image coords.
-
-    Uses ``nuke.zoom()`` (pixels-per-unit) and ``nuke.center()``
-    (image-space centre of the viewport).  Y is flipped because
-    Qt  has Y-down, Nuke has Y-up.
-    """
-    try:
-        z = nuke.zoom()
-        cx, cy = nuke.center()
-        w, h = widget.width(), widget.height()
-        ix = cx + (wx - w / 2.0) / z
-        iy = cy + (h / 2.0 - wy) / z
-        return ix, iy
-    except Exception:
-        return None, None
-
-
-def _image_to_widget(overlay: QtWidgets.QWidget,
-                     ix: float, iy: float
-                     ) -> Tuple[float, float]:
-    """Image coords → overlay widget pixel coords."""
-    try:
-        z = nuke.zoom()
-        cx, cy = nuke.center()
-        w, h = overlay.width(), overlay.height()
-        wx = (ix - cx) * z + w / 2.0
-        wy = h / 2.0 - (iy - cy) * z
-        return wx, wy
-    except Exception:
-        return 0.0, 0.0
-
-
-def _get_h2_node() -> Optional[nuke.Node]:
-    """Return the first selected H2_SamViT node, or *None*."""
-    try:
-        for n in nuke.selectedNodes():
-            if n.knob("model_family") and n.knob("enable_edit"):
-                return n
-    except Exception:
-        pass
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Event filter (installed on the viewer widget)
-# ─────────────────────────────────────────────────────────────────────
-
-class _ViewerEventFilter(QtCore.QObject):
-    """Intercepts Ctrl+Click (points) and Shift+Drag (bbox) on the
-    Nuke viewer, forwarding everything else untouched.
-    """
-
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
-        self._dragging: bool = False
-        self._drag_start: Optional[Tuple[float, float]] = None
-
-    # ── core ──────────────────────────────────────────────────────
-
-    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
-        node = _get_h2_node()
-        if node is None:
-            return False
-
-        ek = node.knob("enable_edit")
-        if not ek or not ek.value():
-            return False
-
-        etype = event.type()
-
-        # ── Mouse Press ───────────────────────────────────────────
-        if etype == _MousePress:
-            mods = event.modifiers()
-            btn  = event.button()
-            ex, ey = _event_xy(event)
-
-            # Ctrl + Left → FG point
-            if mods == _ControlMod and btn == _LeftBtn:
-                ix, iy = _widget_to_image(obj, ex, ey)
-                if ix is not None:
-                    from H2_SamViT_Gizmo import callbacks
-                    callbacks.add_point(node, ix, iy, is_foreground=True)
-                    _refresh()
-                    print(f"[H2 SamViT] FG point at ({ix:.0f}, {iy:.0f})")
-                return True
-
-            # Ctrl + Right → BG point
-            if mods == _ControlMod and btn == _RightBtn:
-                ix, iy = _widget_to_image(obj, ex, ey)
-                if ix is not None:
-                    from H2_SamViT_Gizmo import callbacks
-                    callbacks.add_point(node, ix, iy, is_foreground=False)
-                    _refresh()
-                    print(f"[H2 SamViT] BG point at ({ix:.0f}, {iy:.0f})")
-                return True
-
-            # Shift + Left → start bbox drag
-            if mods == _ShiftMod and btn == _LeftBtn:
-                self._dragging = True
-                self._drag_start = (ex, ey)
-                return True
-
-        # ── Mouse Move (only during Shift-drag) ──────────────────
-        if etype == _MouseMove and self._dragging:
-            ex, ey = _event_xy(event)
-            if _overlay_widget and self._drag_start:
-                _overlay_widget.set_temp_bbox(self._drag_start, (ex, ey))
-                _overlay_widget.update()
-            return True
-
-        # ── Mouse Release (finish bbox) ──────────────────────────
-        if etype == _MouseRelease and self._dragging:
-            ex, ey = _event_xy(event)
-            if self._drag_start:
-                ix1, iy1 = _widget_to_image(obj, *self._drag_start)
-                ix2, iy2 = _widget_to_image(obj, ex, ey)
-                if ix1 is not None and ix2 is not None:
-                    from H2_SamViT_Gizmo import callbacks
-                    callbacks.set_bbox(node, ix1, iy1, ix2, iy2)
-                    bk = node.knob("bbox_enabled")
-                    if bk:
-                        bk.setValue(1)
-                    print(f"[H2 SamViT] Bbox ({ix1:.0f},{iy1:.0f})"
-                          f" \u2192 ({ix2:.0f},{iy2:.0f})")
-            self._dragging = False
-            self._drag_start = None
-            if _overlay_widget:
-                _overlay_widget.clear_temp_bbox()
-                _overlay_widget.update()
-            return True
-
-        return False                       # pass all other events through
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Overlay widget (transparent, drawn on top of the viewer)
-# ─────────────────────────────────────────────────────────────────────
-
-class _OverlayWidget(QtWidgets.QWidget):
-    """Transparent painting surface for coloured point / bbox annotations.
-
-    Mouse events pass straight through to the viewer underneath
-    (``WA_TransparentForMouseEvents``).
-    """
-
-    def __init__(self, viewer: QtWidgets.QWidget) -> None:
-        super().__init__(viewer)
-        self._viewer = viewer
-        self._temp_bbox: Optional[Tuple[Tuple[float, float],
-                                        Tuple[float, float]]] = None
-
-        self.setAttribute(_WA_TransMouse, True)
-        self.setAttribute(_WA_TransBG, True)
-        self.setStyleSheet("background: transparent;")
-        self.setGeometry(0, 0, viewer.width(), viewer.height())
-
-        # Default colours (overridden from node knobs in paint)
-        self._fg_col  = QtGui.QColor(0, 255, 0, 200)
-        self._bg_col  = QtGui.QColor(255, 0, 0, 200)
-        self._box_col = QtGui.QColor(0, 167, 255, 200)
-
-        # Periodic sync (geometry + repaint)
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(80)           # ~12 fps
-
-        self.show()
-        self.raise_()
-
-    # ── public helpers ────────────────────────────────────────────
-
-    def set_temp_bbox(self,
-                      start: Tuple[float, float],
-                      current: Tuple[float, float]) -> None:
-        self._temp_bbox = (start, current)
-
-    def clear_temp_bbox(self) -> None:
-        self._temp_bbox = None
-
-    # ── internal ──────────────────────────────────────────────────
-
-    def _tick(self) -> None:
-        if self._viewer:
-            vw, vh = self._viewer.width(), self._viewer.height()
-            if self.width() != vw or self.height() != vh:
-                self.setGeometry(0, 0, vw, vh)
-        self.raise_()
-        self.update()
-
-    def _read_colours(self, node: nuke.Node) -> None:
-        """Update internal colour cache from the node's knobs."""
-        def _kc(name: str, default: QtGui.QColor) -> QtGui.QColor:
-            k = node.knob(name)
-            if not k:
-                return default
-            v = k.value()
-            if isinstance(v, (list, tuple)) and len(v) >= 3:
-                r, g, b = [min(255, max(0, int(c * 255))) for c in v[:3]]
-                a = int(v[3] * 255) if len(v) >= 4 else 200
-                return QtGui.QColor(r, g, b, a)
-            return default
-
-        self._fg_col  = _kc("fg_point_color", QtGui.QColor(0, 255, 0, 200))
-        self._bg_col  = _kc("bg_point_color", QtGui.QColor(255, 0, 0, 200))
-        self._box_col = _kc("bbox_color",     QtGui.QColor(0, 167, 255, 200))
-
-    # ── painting ──────────────────────────────────────────────────
-
-    def paintEvent(self, event) -> None:   # noqa: N802
-        node = _get_h2_node()
-        if node is None:
-            return
-
-        sk = node.knob("show_ui_overlays")
-        if sk and not sk.value():
-            return
-
-        self._read_colours(node)
-
-        scale = 1.0
-        sk2 = node.knob("overlay_scale")
-        if sk2:
-            try:
-                scale = float(sk2.value())
-            except Exception:
-                pass
-
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(_Antialiasing)
-
-        self._paint_bbox(painter, node, scale)
-        self._paint_temp_bbox(painter, scale)
-        self._paint_points(painter, node, scale)
-
-        painter.end()
-
-    # ── points ────────────────────────────────────────────────────
-
-    def _paint_points(self, p: QtGui.QPainter,
-                      node: nuke.Node, scale: float) -> None:
-        from H2_SamViT_Gizmo import callbacks
-        points = callbacks.get_enabled_points(node)
-
-        r = 7 * scale
-        show_labels = True
-        lk = node.knob("show_point_labels")
-        if lk:
-            show_labels = bool(lk.value())
-
-        for pt in points:
-            wx, wy = _image_to_widget(self, pt["x"], pt["y"])
-            colour = self._fg_col if pt["is_foreground"] else self._bg_col
-
-            # Filled circle with white border
-            p.setBrush(QtGui.QBrush(colour))
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 220),
-                                1.5 * scale))
-            p.drawEllipse(QtCore.QPointF(wx, wy), r, r)
-
-            # +/\u2013 symbol
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 255),
-                                max(1.0, 2 * scale)))
-            half = r * 0.5
-            p.drawLine(QtCore.QPointF(wx - half, wy),
-                       QtCore.QPointF(wx + half, wy))
-            if pt["is_foreground"]:
-                p.drawLine(QtCore.QPointF(wx, wy - half),
-                           QtCore.QPointF(wx, wy + half))
-
-            # Label
-            if show_labels:
-                font = p.font()
-                font.setPixelSize(max(10, int(11 * scale)))
-                font.setBold(True)
-                p.setFont(font)
-                p.setPen(QtGui.QColor(255, 255, 255, 220))
-                p.drawText(int(wx + r + 3), int(wy - r + 3),
-                           str(pt["index"]))
-
-    # ── bounding box ──────────────────────────────────────────────
-
-    def _paint_bbox(self, p: QtGui.QPainter,
-                    node: nuke.Node, scale: float) -> None:
-        from H2_SamViT_Gizmo import callbacks
-        bbox = callbacks.get_bbox(node)
-        if not bbox:
-            return
-
-        x1, y1, x2, y2 = bbox
-        wx1, wy1 = _image_to_widget(self, x1, y1)
-        wx2, wy2 = _image_to_widget(self, x2, y2)
-
-        pen = QtGui.QPen(self._box_col, 2 * scale)
-        pen.setStyle(_DashLine)
-        p.setPen(pen)
-        fill = QtGui.QColor(self._box_col)
-        fill.setAlpha(30)
-        p.setBrush(QtGui.QBrush(fill))
-
-        rect = QtCore.QRectF(
-            min(wx1, wx2), min(wy1, wy2),
-            abs(wx2 - wx1), abs(wy2 - wy1),
-        )
-        p.drawRect(rect)
-
-        # Corner handles
-        hs = 5 * scale
-        p.setBrush(QtGui.QBrush(self._box_col))
-        p.setPen(_NoPen)
-        for cx, cy in [(wx1, wy1), (wx2, wy1), (wx2, wy2), (wx1, wy2)]:
-            p.drawRect(QtCore.QRectF(cx - hs, cy - hs, hs * 2, hs * 2))
-
-    # ── temp bbox (while Shift-dragging) ──────────────────────────
-
-    def _paint_temp_bbox(self, p: QtGui.QPainter, scale: float) -> None:
-        if self._temp_bbox is None:
-            return
-        (sx, sy), (cx, cy) = self._temp_bbox
-
-        pen = QtGui.QPen(self._box_col, 2 * scale)
-        pen.setStyle(_DashDotLine)
-        p.setPen(pen)
-        fill = QtGui.QColor(self._box_col)
-        fill.setAlpha(40)
-        p.setBrush(QtGui.QBrush(fill))
-
-        rect = QtCore.QRectF(
-            min(sx, cx), min(sy, cy),
-            abs(cx - sx), abs(cy - sy),
-        )
-        p.drawRect(rect)
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  Viewer-widget finder
-# ─────────────────────────────────────────────────────────────────────
-
-def _find_viewer_widget() -> Optional[QtWidgets.QWidget]:
-    """Heuristically locate Nuke's main image-viewer GL widget.
-
-    Searches the Qt widget hierarchy for a large, visible widget whose
-    class name suggests it is an OpenGL viewport (common names across
-    Nuke versions: ``GLViewer``, ``QOpenGLWidget``, ``Viewport``,
-    various ``Foundry::`` prefixed classes).
-    """
-    app = QtWidgets.QApplication.instance()
-    if not app:
-        return None
-
-    best: Optional[QtWidgets.QWidget] = None
-    best_score = 0
-
-    for w in app.allWidgets():
-        if not isinstance(w, QtWidgets.QWidget):
-            continue
-        if not w.isVisible() or w.width() < 200 or w.height() < 200:
-            continue
-
-        cn = w.metaObject().className()
-        on = w.objectName().lower()
-
-        # Skip standard container widgets
-        if isinstance(w, (QtWidgets.QMainWindow, QtWidgets.QMenuBar,
-                          QtWidgets.QStatusBar, QtWidgets.QToolBar,
-                          QtWidgets.QDockWidget, QtWidgets.QSplitter,
-                          QtWidgets.QStackedWidget, QtWidgets.QTabWidget,
-                          QtWidgets.QTabBar, QtWidgets.QScrollArea)):
-            continue
-
-        # Skip DAG / properties / script editor
-        if any(k in on for k in ('dag', 'node', 'script', 'propert',
-                                  'curve', 'dope')):
-            continue
-        if any(k in cn for k in ('DAG', 'NodeGraph', 'ScriptEditor',
-                                  'CurveEditor', 'DopeSheet')):
-            continue
-
-        area = w.width() * w.height()
-        score = area
-
-        # Boost score for class-name hints
-        if any(k in cn for k in ('GL', 'OpenGL', 'Viewport', 'Viewer')):
-            score *= 100
-
-        if score > best_score:
-            best_score = score
-            best = w
-
-    return best
+def _knob_rgb(node, name: str, default: Tuple[int, int, int] = (0, 255, 0)):
+    """Read a Color_Knob (type 18) and return an (R, G, B) tuple 0-255."""
+    k = node.knob(name)
+    if not k:
+        return default
+    v = k.value()
+    if isinstance(v, (list, tuple)) and len(v) >= 3:
+        return tuple(min(255, max(0, int(c * 255))) for c in v[:3])
+    return default
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  Public API
 # ─────────────────────────────────────────────────────────────────────
 
-def _refresh() -> None:
-    """Trigger an immediate repaint of the overlay."""
-    if _overlay_widget:
-        _overlay_widget.update()
+def render_overlay(node) -> None:
+    """(Re-)generate the coloured overlay image and update the gizmo.
 
+    Called from ``callbacks.py`` whenever points, bbox, or appearance
+    knobs change.  Writes a transparent RGBA PNG and injects it into
+    the gizmo's internal OverlaySource Read node.  The OverlayMerge
+    node composites it over the main image (RGB only — alpha is
+    preserved from CopyAlpha).
+    """
+    path = render_overlay_image(node)
+    if path is None:
+        clear_overlay(node)
+        return
+    _update_overlay_node(node, path)
+
+
+def render_overlay_image(node) -> Optional[str]:
+    """Render the coloured overlay PNG and return its file path.
+
+    Returns ``None`` if there are no points or bbox to draw, or if
+    Pillow is not available.  This function does NOT touch the Nuke
+    node graph and is therefore safe to call from ``knobChanged``.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None  # Pillow not available — skip overlay
+
+    # ── Input dimensions ────────────────────────────────────────
+    input_node = node.input(0)
+    if not input_node:
+        return None
+    fmt = input_node.format()
+    w, h = fmt.width(), fmt.height()
+    if w < 1 or h < 1:
+        return None
+
+    # ── Collect prompts ─────────────────────────────────────────
+    from . import callbacks
+    points = callbacks.get_enabled_points(node)
+    bbox = callbacks.get_bbox(node)
+    neg_bbox = callbacks.get_neg_bbox(node)
+
+    if not points and not bbox and not neg_bbox:
+        return None
+
+    # ── Appearance knobs ────────────────────────────────────────
+    fg_rgb  = _knob_rgb(node, "fg_point_color", (0, 255, 0))
+    bg_rgb  = _knob_rgb(node, "bg_point_color", (255, 0, 0))
+    box_rgb = _knob_rgb(node, "bbox_color",     (0, 167, 255))
+    neg_box_rgb = _knob_rgb(node, "neg_bbox_color", (255, 77, 0))
+
+    scale = 1.0
+    sk = node.knob("overlay_scale")
+    if sk:
+        try:
+            scale = max(0.25, float(sk.value()))
+        except Exception:
+            pass
+
+    show_labels = True
+    lk = node.knob("show_point_labels")
+    if lk:
+        show_labels = bool(lk.value())
+
+    # ── Create transparent RGBA image ───────────────────────────
+    img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    radius = max(4, int(10 * scale))
+    half   = max(2, int(radius * 0.5))
+    lw     = max(1, int(2 * scale))
+
+    # ── Draw bounding box ───────────────────────────────────────
+    if bbox:
+        bx1, by1, bx2, by2 = bbox
+        # Nuke Y-up → image Y-down
+        iy_top = int(h - by2)
+        iy_bot = int(h - by1)
+        ix_left, ix_right = int(bx1), int(bx2)
+
+        # Semi-transparent fill
+        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
+                       fill=(*box_rgb, 25))
+        # Solid border
+        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
+                       outline=(*box_rgb, 200),
+                       width=max(1, int(2 * scale)))
+        # Corner handles
+        hs = max(3, int(6 * scale))
+        for cx, cy in [(ix_left, iy_top), (ix_right, iy_top),
+                       (ix_right, iy_bot), (ix_left, iy_bot)]:
+            draw.rectangle([cx - hs, cy - hs, cx + hs, cy + hs],
+                           fill=(*box_rgb, 230))
+
+    # ── Draw negative bounding box (SAM3 exclude region) ────────
+    if neg_bbox:
+        bx1, by1, bx2, by2 = neg_bbox
+        iy_top = int(h - by2)
+        iy_bot = int(h - by1)
+        ix_left, ix_right = int(bx1), int(bx2)
+
+        # Semi-transparent fill (red-ish tint)
+        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
+                       fill=(*neg_box_rgb, 30))
+        # Dashed-style border (solid for now — PIL has no dashes)
+        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
+                       outline=(*neg_box_rgb, 200),
+                       width=max(1, int(2 * scale)))
+        # Corner handles
+        hs = max(3, int(6 * scale))
+        for cx, cy in [(ix_left, iy_top), (ix_right, iy_top),
+                       (ix_right, iy_bot), (ix_left, iy_bot)]:
+            draw.rectangle([cx - hs, cy - hs, cx + hs, cy + hs],
+                           fill=(*neg_box_rgb, 230))
+        # Draw an × across the box to indicate "exclude"
+        draw.line([(ix_left, iy_top), (ix_right, iy_bot)],
+                  fill=(*neg_box_rgb, 120), width=max(1, int(1.5 * scale)))
+        draw.line([(ix_right, iy_top), (ix_left, iy_bot)],
+                  fill=(*neg_box_rgb, 120), width=max(1, int(1.5 * scale)))
+
+    # ── Draw points ─────────────────────────────────────────────
+    # Try to load a font once for labels
+    _font = None
+    if show_labels:
+        try:
+            fsize = max(10, int(13 * scale))
+            for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"):
+                if os.path.isfile(path):
+                    _font = ImageFont.truetype(path, fsize)
+                    break
+            if _font is None:
+                _font = ImageFont.load_default()
+        except Exception:
+            _font = None
+
+    for pt in points:
+        px = int(pt["x"])
+        py = int(h - pt["y"])  # Nuke Y-up → image Y-down
+        col = fg_rgb if pt["is_foreground"] else bg_rgb
+
+        # Filled circle with white outline
+        draw.ellipse([px - radius, py - radius, px + radius, py + radius],
+                     fill=(*col, 200),
+                     outline=(255, 255, 255, 230),
+                     width=max(1, int(1.5 * scale)))
+
+        # +  (FG) or –  (BG) symbol
+        draw.line([(px - half, py), (px + half, py)],
+                  fill=(255, 255, 255, 255), width=lw)
+        if pt["is_foreground"]:
+            draw.line([(px, py - half), (px, py + half)],
+                      fill=(255, 255, 255, 255), width=lw)
+
+        # Numeric index label
+        if show_labels and _font is not None:
+            try:
+                draw.text((px + radius + 4, py - radius - 2),
+                          str(pt["index"]),
+                          fill=(255, 255, 255, 220), font=_font)
+            except Exception:
+                pass
+
+    # ── Save PNG (fast, minimal compression) ────────────────────
+    overlay_path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
+    img.save(overlay_path, "PNG", compress_level=1)
+
+    return overlay_path
+
+
+def refresh_overlay_safe(node) -> None:
+    """Re-render overlay and update an existing Read node.
+
+    Safe to call from ``knobChanged`` because it does NOT use
+    ``node.begin()``/``node.end()`` — it accesses the internal
+    OverlaySource node via its full hierarchical name.
+
+    Only works after the first ``render_overlay()`` call has already
+    converted OverlaySource from a Constant to a Read node.
+    """
+    path = render_overlay_image(node)
+    if path is None:
+        return
+
+    # Access the internal node via its full path — no begin/end needed.
+    try:
+        src = nuke.toNode(node.fullName() + ".OverlaySource")
+        if src and src.Class() != "Constant":
+            src["file"].setValue(path)
+            try:
+                src["reload"].execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def initialize_overlay(node) -> None:
+    """Pre-create OverlaySource as a Read node for live overlay updates.
+
+    Called from ``on_create`` so that ``refresh_overlay_safe()`` can
+    update the overlay from ``knobChanged`` without needing
+    ``node.begin()``/``node.end()``.
+
+    Creates a minimal transparent PNG and converts the default Constant
+    into a Read node pointing to it.  Subsequent calls to
+    ``render_overlay_image`` + ``refresh_overlay_safe`` will overwrite
+    that PNG with the real coloured overlay.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return  # Pillow not installed yet — skip
+
+    # Create a small transparent placeholder PNG
+    path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
+    if not os.path.exists(path):
+        img = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+        img.save(path, "PNG")
+
+    node.begin()
+    try:
+        src = nuke.toNode("OverlaySource")
+        if src and src.Class() == "Constant":
+            xp, yp = src.xpos(), src.ypos()
+            merge = nuke.toNode("OverlayMerge")
+            copy_alpha = nuke.toNode("CopyAlpha")
+
+            nuke.delete(src)
+
+            r = nuke.nodes.Read()
+            r.setName("OverlaySource")
+            r["file"].setValue(path)
+            r["raw"].setValue(True)
+            # Ensure overlay is visible at ANY timeline frame
+            r["first"].setValue(1)
+            r["last"].setValue(1)
+            r["before"].setValue("hold")
+            r["after"].setValue("hold")
+            r["on_error"].setValue("nearest frame")
+            r.setXpos(xp)
+            r.setYpos(yp)
+
+            if merge and copy_alpha:
+                merge.setInput(0, copy_alpha)
+                merge.setInput(1, r)
+    finally:
+        node.end()
+
+
+def clear_overlay(node) -> None:
+    """Remove any overlay — write a transparent PNG and update the Read.
+
+    Keeps OverlaySource as a Read node (does NOT revert to Constant)
+    so that ``refresh_overlay_safe()`` continues to work from
+    ``knobChanged`` callbacks.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+
+    # Determine dimensions from input
+    input_node = node.input(0)
+    if input_node:
+        fmt = input_node.format()
+        w, h = fmt.width(), fmt.height()
+    else:
+        w, h = 4, 4
+
+    # Write transparent PNG
+    path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    img.save(path, "PNG", compress_level=1)
+
+    # Update the Read node (or create it from Constant)
+    _update_overlay_node(node, path)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Internal helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def _update_overlay_node(node, path: str) -> None:
+    """Swap the OverlaySource Constant → Read (first call) or reload
+    the existing Read node (subsequent calls)."""
+    node.begin()
+    try:
+        src        = nuke.toNode("OverlaySource")
+        merge      = nuke.toNode("OverlayMerge")
+        copy_alpha = nuke.toNode("CopyAlpha")
+
+        if src is None:
+            return
+
+        if src.Class() == "Constant":
+            # First overlay — replace Constant with a Read node
+            xp, yp = src.xpos(), src.ypos()
+            nuke.delete(src)
+
+            r = nuke.nodes.Read()
+            r.setName("OverlaySource")
+            r["file"].setValue(path)
+            r["raw"].setValue(True)  # Overlay is pre-rendered data — no colorspace
+            # Ensure overlay is visible at ANY timeline frame
+            r["first"].setValue(1)
+            r["last"].setValue(1)
+            r["before"].setValue("hold")
+            r["after"].setValue("hold")
+            r["on_error"].setValue("nearest frame")
+            r.setXpos(xp)
+            r.setYpos(yp)
+
+            # Re-wire Merge inputs: B = main image, A = overlay
+            if merge and copy_alpha:
+                merge.setInput(0, copy_alpha)
+                merge.setInput(1, r)
+        else:
+            # Existing Read — just update file path and reload
+            src["file"].setValue(path)
+            try:
+                src["reload"].execute()
+            except Exception:
+                pass
+    finally:
+        node.end()
+
+    try:
+        nuke.updateUI()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Backward-compat stubs
+# ─────────────────────────────────────────────────────────────────────
+# Old code called install() / ensure_installed() for a Qt overlay.
+# These are now harmless no-ops — the overlay is rendered into the
+# gizmo's internal node graph instead.
 
 def install() -> bool:
-    """Install the viewer event-filter and overlay widget.
-
-    Safe to call multiple times — subsequent calls are no-ops.
-    Returns *True* on success.
-    """
-    global _installed, _event_filter, _overlay_widget, _viewer_widget
-
-    if _installed:
-        return True
-
-    viewer = _find_viewer_widget()
-    if not viewer:
-        _schedule_retry()
-        return False
-
-    _event_filter  = _ViewerEventFilter()
-    _overlay_widget = _OverlayWidget(viewer)
-    viewer.installEventFilter(_event_filter)
-
-    _viewer_widget = viewer
-    _installed = True
-    print("[H2 SamViT] Viewer overlay installed  "
-          "(Ctrl+LClick = FG,  Ctrl+RClick = BG,  Shift+Drag = Bbox)")
+    """No-op — overlay is now rendered via internal gizmo nodes."""
     return True
 
-
-def _schedule_retry() -> None:
-    """Retry ``install()`` after a short delay (viewer may not exist yet)."""
-    global _retry_timer, _retry_count
-    if _retry_count >= 10:
-        return                      # give up after 10 attempts
-    if _retry_timer is not None:
-        return                      # already scheduled
-    _retry_timer = QtCore.QTimer()
-    _retry_timer.setSingleShot(True)
-    _retry_timer.timeout.connect(_do_retry)
-    _retry_timer.start(2000)
-
-
-def _do_retry() -> None:
-    global _retry_timer, _retry_count
-    _retry_timer = None
-    _retry_count += 1
-    if not install():
-        _schedule_retry()
-
-
 def uninstall() -> None:
-    """Remove the overlay and event-filter."""
-    global _installed, _event_filter, _overlay_widget, _viewer_widget
-    if not _installed:
-        return
-    try:
-        if _viewer_widget and _event_filter:
-            _viewer_widget.removeEventFilter(_event_filter)
-    except Exception:
-        pass
-    try:
-        if _overlay_widget:
-            _overlay_widget.hide()
-            _overlay_widget.deleteLater()
-    except Exception:
-        pass
-    _event_filter   = None
-    _overlay_widget = None
-    _viewer_widget  = None
-    _installed      = False
-
+    """No-op."""
+    pass
 
 def ensure_installed() -> None:
-    """Try to install if not already done (called from callbacks)."""
-    if not _installed:
-        install()
+    """No-op."""
+    pass

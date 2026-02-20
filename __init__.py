@@ -4,7 +4,7 @@
 # A comprehensive AI-powered segmentation and matting gizmo combining
 # SAM3 (Segment Anything Model 3) with ViTMatte for high-quality alpha mattes.
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "H2"
 
 import os
@@ -48,12 +48,12 @@ def register():
     # Register knob-changed handlers
     from . import callbacks  # noqa: F811
 
-    # Install interactive viewer overlay (Ctrl+click, Shift+drag)
+    # Install viewer click handler (Ctrl+Click to place points/bbox)
     try:
-        from . import ui_overlay
-        ui_overlay.install()
-    except Exception as _ov_exc:
-        print(f"[H2_SamViT_Gizmo] Viewer overlay not installed: {_ov_exc}")
+        from . import viewer_events
+        viewer_events.install()
+    except Exception as _e:
+        print(f"[H2_SamViT_Gizmo] Viewer click handler not installed: {_e}")
 
     print(f"[H2_SamViT_Gizmo] Registered v{__version__}")
 

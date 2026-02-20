@@ -279,9 +279,19 @@ def build_sam2_predictor(
 
     model = _build_sam2_from_local_config(cfg, str(cp), device)
 
-    dtype = _torch_dtype(precision)
-    if dtype is not None and device.type != "cpu":
-        model = model.to(dtype)
+    # IMPORTANT: Do NOT cast model weights to fp16/bf16!
+    # Like SAM3, SAM2 must stay in float32.  Mixed precision is handled
+    # dynamically via torch.autocast during inference — this is the
+    # official inference pattern from facebookresearch/sam2.
+    # Casting weights directly causes numerical precision loss in the
+    # mask decoder and degrades segmentation quality.
+
+    # Enable TF32 for Ampere+ GPUs (faster fp32 math, no accuracy loss)
+    if device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     predictor = SAM2ImagePredictor(model)
     print(f"[H2 SamViT] SAM2 v{version} {size} ready.")

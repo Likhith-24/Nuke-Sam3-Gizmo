@@ -48,30 +48,36 @@ def get_device():
     return torch.device("cpu")
 
 
-def _get_autocast_dtype():
-    """Return the optimal autocast dtype for the current GPU.
+def _resolve_autocast_ctx(precision: str):
+    """Return a ``torch.autocast`` context for the given precision knob.
 
-    Following the pattern from ComfyUI-SAM3 / official SAM3 codebase:
-      • Ampere+ (compute capability ≥ 8) → bfloat16
-      • Volta / Turing (≥ 7)              → float16
-      • Older / CPU / MPS                → None  (no autocast)
+    Maps the user-facing precision string (``fp16`` / ``bf16`` / ``fp32``)
+    to the correct ``torch.autocast`` call.  Falls back gracefully when
+    the GPU does not support the requested dtype.
 
-    SAM3 keeps its weights in float32 — autocast handles mixed-precision
-    dynamically at the activation level, avoiding the dtype mismatches
-    that occur when model weights are explicitly cast.
+    Both SAM2 and SAM3 keep their weights in float32 — autocast handles
+    mixed-precision dynamically at the activation level, following the
+    official inference pattern from facebookresearch/sam2 and sam3.
     """
     import torch
-    if not torch.cuda.is_available():
-        return None
-    try:
-        major, _ = torch.cuda.get_device_capability()
-    except Exception:
-        return None
-    if major >= 8:
-        return torch.bfloat16
-    elif major >= 7:
-        return torch.float16
-    return None
+    from contextlib import nullcontext
+
+    if precision == "fp32" or not torch.cuda.is_available():
+        return nullcontext()
+
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
+    dtype = dtype_map.get(precision, torch.bfloat16)
+
+    # Fall back to fp16 if GPU doesn't support bf16 (pre-Ampere)
+    if dtype == torch.bfloat16:
+        try:
+            major, _ = torch.cuda.get_device_capability()
+            if major < 8:
+                dtype = torch.float16
+        except Exception:
+            dtype = torch.float16
+
+    return torch.autocast(device_type="cuda", dtype=dtype)
 
 
 def load_sam_model(node):
@@ -295,7 +301,8 @@ def refine_mask_with_vitmatte(
 def run_point_bbox_inference(
     node,
     points: List[Dict[str, Any]],
-    bbox: Optional[Tuple[float, float, float, float]]
+    bbox: Optional[Tuple[float, float, float, float]],
+    neg_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> None:
     """Run SAM inference with points and/or bounding box prompts.
 
@@ -303,32 +310,37 @@ def run_point_bbox_inference(
     ``SAM2ImagePredictor`` and ``SAM3InteractiveImagePredictor``
     share the same ``set_image`` / ``predict`` API.
 
-    For SAM3 the model stays in float32 — ``torch.autocast`` wraps
-    the forward pass so activations run in bf16/fp16 automatically.
+    For SAM3 with a negative bbox: the neg bbox corners are added as
+    background (label=0) points to steer the model away from that
+    region — SAM's instance segmentation path does not natively support
+    negative boxes, but background points at the neg bbox corners
+    achieve the same effect.
+
+    Following the official SAM2/SAM3 inference pattern:
+      • ``torch.inference_mode()`` for maximum efficiency
+      • ``torch.autocast`` for mixed-precision (bf16/fp16)
+      • Model weights stay in float32 — autocast handles precision
+      • ``multimask_output`` is True for single-point prompts (ambiguous)
+        and False for multi-point or box prompts (clear intent)
     """
     import torch
     import nuke
-    from contextlib import nullcontext
 
     try:
         sam_predictor = load_sam_model(node)
 
         image = image_from_nuke_node(node)
 
-        # Determine whether to wrap in autocast (SAM3 only, CUDA only).
-        family = node.knob("model_family").value()
-        autocast_dtype = _get_autocast_dtype() if family == "SAM3" else None
-        amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype)
-            if autocast_dtype is not None
-            else nullcontext()
-        )
+        # Determine autocast context from the precision knob.
+        # Both SAM2 and SAM3 use the same pattern: fp32 weights + autocast.
+        precision = node.knob("model_precision").value()
+        amp_ctx = _resolve_autocast_ctx(precision)
 
         # Image height needed to flip Y coordinates from Nuke
         # (bottom-left origin) to SAM (top-left origin).
         img_h = image.shape[0]
 
-        with amp_ctx:
+        with torch.inference_mode(), amp_ctx:
             sam_predictor.set_image(image)
 
             # Prepare prompts
@@ -338,21 +350,57 @@ def run_point_bbox_inference(
 
             if points:
                 point_coords = np.array(
-                    [[p["x"], img_h - p["y"]] for p in points]
+                    [[p["x"], img_h - p["y"]] for p in points],
+                    dtype=np.float32,
                 )
-                point_labels = np.array([p["label"] for p in points])
+                point_labels = np.array(
+                    [p["label"] for p in points],
+                    dtype=np.int32,
+                )
 
             if bbox:
                 x1, y1_nk, x2, y2_nk = bbox
-                box = np.array([x1, img_h - y2_nk, x2, img_h - y1_nk])
-
-            with torch.no_grad():
-                masks, scores, logits = sam_predictor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    box=box,
-                    multimask_output=True,
+                box = np.array(
+                    [x1, img_h - y2_nk, x2, img_h - y1_nk],
+                    dtype=np.float32,
                 )
+
+            # Negative bbox → add its 4 corners as background points
+            # (label=0).  SAM's instance segmentation path doesn't
+            # natively support negative boxes, but background points at
+            # the corners effectively exclude that region.
+            if neg_bbox:
+                nx1, ny1_nk, nx2, ny2_nk = neg_bbox
+                neg_corners = np.array([
+                    [nx1, img_h - ny2_nk],
+                    [nx2, img_h - ny2_nk],
+                    [nx1, img_h - ny1_nk],
+                    [nx2, img_h - ny1_nk],
+                    [(nx1 + nx2) / 2, (img_h - ny2_nk + img_h - ny1_nk) / 2],
+                ], dtype=np.float32)
+                neg_labels = np.zeros(len(neg_corners), dtype=np.int32)
+
+                if point_coords is not None:
+                    point_coords = np.concatenate(
+                        [point_coords, neg_corners], axis=0)
+                    point_labels = np.concatenate(
+                        [point_labels, neg_labels], axis=0)
+                else:
+                    point_coords = neg_corners
+                    point_labels = neg_labels
+
+            # Smart multimask_output:
+            # - 1 point, no box → True  (ambiguous prompt, pick best of 3)
+            # - 2+ points or box → False (clear intent, single best mask)
+            num_prompts = (len(points) if points else 0) + (1 if bbox else 0)
+            use_multimask = num_prompts <= 1
+
+            masks, scores, logits = sam_predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=box,
+                multimask_output=use_multimask,
+            )
 
         best_idx = int(np.argmax(scores))
         coarse_mask = masks[best_idx]
@@ -416,29 +464,18 @@ def _run_text_inference_sam3(
 
     processor = Sam3Processor(_sam3_model)
 
-    # SAM3 stays in float32 — autocast handles mixed precision dynamically.
-    # Select the right autocast dtype based on GPU capability.
-    autocast_dtype = _get_autocast_dtype()
-    device_type = str(_sam3_model.device).split(":")[0]      # "cuda" / "cpu"
+    # Use precision from the knob — autocast handles mixed precision.
+    precision = node.knob("model_precision").value()
+    amp_ctx = _resolve_autocast_ctx(precision)
 
-    if autocast_dtype is not None and device_type == "cuda":
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            state  = processor.set_image(pil_image)
-            output = processor.set_text_prompt(text_prompt, state)
-    else:
-        # CPU / MPS or old GPU — no autocast, pure float32
-        with torch.no_grad():
-            state  = processor.set_image(pil_image)
-            output = processor.set_text_prompt(text_prompt, state)
+    with torch.inference_mode(), amp_ctx:
+        state  = processor.set_image(pil_image)
+        output = processor.set_text_prompt(text_prompt, state)
 
-    # output dict:  "masks" [N,H,W] bool,  "boxes" [N,4],  "scores" [N]
     masks  = output["masks"]
     scores = output["scores"]
     boxes  = output.get("boxes", None)
 
-    # Convert tensors → numpy.
-    # Autocast may produce bfloat16 tensors — numpy doesn't support bf16,
-    # so we always cast to float32 first.
     if hasattr(masks, "cpu"):
         masks = masks.cpu().float().numpy()
     if hasattr(scores, "cpu"):
@@ -458,11 +495,37 @@ def _run_text_inference_sam3(
 
     coarse_mask = masks[selected_idx].astype(np.float32)
 
-    # SAM3 text masks have shape [N, 1, H, W] (4-D).  After indexing
-    # by selected_idx the result is (1, H, W).  OpenCV/ViTMatte expect
-    # a plain 2-D (H, W) array, so squeeze any leading singleton dims.
     while coarse_mask.ndim > 2:
         coarse_mask = coarse_mask.squeeze(0)
+
+    # ── If the text detection found a bounding box, refine using that
+    # box as an additional SAM point/bbox prompt for better coverage ──
+    if boxes is not None and len(boxes) > 0 and _sam3_model is not None:
+        try:
+            sel_box = boxes[selected_idx]
+            predictor = _sam3_model.inst_interactive_predictor
+            sam_box = np.array([
+                sel_box[0], sel_box[1], sel_box[2], sel_box[3]
+            ])
+
+            with torch.inference_mode(), amp_ctx:
+                predictor.set_image(image)
+                refined_masks, refined_scores, _ = predictor.predict(
+                    box=sam_box,
+                    multimask_output=False,
+                )
+
+            best_refined = int(np.argmax(refined_scores))
+            refined_mask = refined_masks[best_refined].astype(np.float32)
+            while refined_mask.ndim > 2:
+                refined_mask = refined_mask.squeeze(0)
+
+            # Use refined mask if it has better coverage
+            if refined_mask.sum() > coarse_mask.sum() * 0.5:
+                coarse_mask = np.maximum(coarse_mask, refined_mask)
+                print("[H2 SamViT] Text mask refined with box prompt")
+        except Exception as e:
+            print(f"[H2 SamViT] Box refinement skipped: {e}")
 
     # ── Shared refinement pipeline ──
     _refine_and_write(node, image, coarse_mask,
@@ -498,8 +561,8 @@ def _run_text_inference_sam2(
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs["input_ids"],
-        box_threshold=0.3,
-        text_threshold=0.25,
+        box_threshold=0.2,
+        text_threshold=0.2,
         target_sizes=[(image.shape[0], image.shape[1])]
     )[0]
 
@@ -518,12 +581,15 @@ def _run_text_inference_sam2(
     selected_box = boxes[selected_idx]
 
     # ── SAM2 segmentation with detected box ──
-    sam_predictor.set_image(image)
+    precision = node.knob("model_precision").value()
+    amp_ctx = _resolve_autocast_ctx(precision)
 
-    with torch.no_grad():
+    with torch.inference_mode(), amp_ctx:
+        sam_predictor.set_image(image)
+
         masks, mask_scores, logits = sam_predictor.predict(
             box=selected_box,
-            multimask_output=True,
+            multimask_output=False,
         )
 
     best_idx = int(np.argmax(mask_scores))
@@ -540,12 +606,21 @@ def _refine_and_write(
     coarse_mask: np.ndarray,
     log_message: str,
 ) -> None:
-    """Shared refinement / post-processing / write-back pipeline."""
+    """Shared refinement / post-processing / write-back pipeline.
+
+    Alpha handling follows the same pattern as ComfyUI-SAM2 / SAM3:
+    SAM's ``predict()`` returns boolean masks — ``masks > threshold``
+    — which are pure binary (0 or 1).  We keep them binary by default
+    so the resulting alpha channel is **always** pure white (1.0) or
+    pure black (0.0) and is never affected by upstream colour grading.
+
+    ViTMatte soft-alpha refinement is available behind the
+    ``use_vitmatte`` toggle for compositing workflows that need it.
+    """
     import nuke
     from . import callbacks
 
-    # Guarantee the mask is 2-D (H, W).  Some SAM3 code-paths return
-    # masks with extra batch / channel dims, e.g. (1, H, W).
+    # Guarantee the mask is 2-D (H, W).
     while coarse_mask.ndim > 2:
         coarse_mask = coarse_mask.squeeze(0)
 
@@ -553,15 +628,30 @@ def _refine_and_write(
 
     coarse_mask = preprocess_mask(coarse_mask, params)
 
-    erode_radius  = int(params.get("trimap_erode_radius", 3))
-    dilate_radius = int(params.get("trimap_dilate_radius", 10))
-    trimap_width  = max(erode_radius, dilate_radius)
-    if trimap_width > 0:
-        alpha_matte = refine_mask_with_vitmatte(
-            image, coarse_mask, trimap_width, erode_radius, dilate_radius,
-        )
+    # ── ViTMatte refinement (optional — OFF by default) ──
+    use_vitmatte = params.get("use_vitmatte", False)
+
+    if use_vitmatte:
+        erode_radius  = int(params.get("trimap_erode_radius", 3))
+        dilate_radius = int(params.get("trimap_dilate_radius", 10))
+        trimap_width  = max(erode_radius, dilate_radius)
+        if trimap_width > 0:
+            alpha_matte = refine_mask_with_vitmatte(
+                image, coarse_mask, trimap_width, erode_radius, dilate_radius,
+            )
+        else:
+            alpha_matte = coarse_mask.astype(np.float32)
+
+        # Normalize ViTMatte's soft output so the core reaches 1.0
+        alpha_max = float(alpha_matte.max())
+        if 0.01 < alpha_max < 0.95:
+            alpha_matte = np.clip(alpha_matte / alpha_max, 0.0, 1.0)
+        elif alpha_max >= 0.95:
+            alpha_matte = np.clip(alpha_matte, 0.0, 1.0)
     else:
-        alpha_matte = coarse_mask.astype(np.float32)
+        # Pure binary mask — matches ComfyUI-SAM2/SAM3 behaviour.
+        # Alpha is strictly 0.0 or 1.0 and cannot be affected by grading.
+        alpha_matte = (coarse_mask > 0.5).astype(np.float32)
 
     alpha_matte = postprocess_mask(alpha_matte, params)
 
@@ -571,6 +661,16 @@ def _refine_and_write(
         alpha_matte = temporal.apply_consistency(node, alpha_matte, frame, params)
 
     write_mask_to_node(node, alpha_matte, params)
+
+    # ── Render the coloured overlay (points + bbox) ──
+    # Safe here because we are called from a button callback,
+    # not from knobChanged.
+    try:
+        from . import ui_overlay
+        ui_overlay.render_overlay(node)
+    except Exception:
+        pass
+
     print(f"[H2 SamViT] {log_message}")
 
 
@@ -665,11 +765,8 @@ def postprocess_mask(mask: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
         M = np.float32([[1, 0, offset_x], [0, 1, offset_y]])
         mask = cv2.warpAffine(mask, M, (mask.shape[1], mask.shape[0]))
     
-    # Final binary sharp
+    # Final binary sharp — ensures pure 0/1 alpha
     if params["final_binary_sharp"]:
-        mask = (mask > 0.5).astype(np.float32)
-        # Apply slight blur for corner smoothing
-        mask = cv2.GaussianBlur(mask, (3, 3), 0)
         mask = (mask > 0.5).astype(np.float32)
     
     return np.clip(mask, 0, 1)
@@ -720,6 +817,7 @@ def write_mask_to_node(node, mask: np.ndarray, params: Dict[str, Any]) -> None:
             mask_read["file"].setValue(mask_pattern)
             mask_read["first"].setValue(frame)
             mask_read["last"].setValue(frame)
+            mask_read["raw"].setValue(True)  # Mask is data — no colorspace transform
 
             # Re-wire the Copy node
             if copy_alpha and input_node:
