@@ -465,17 +465,19 @@ Gizmo {
  addUserKnob {6 use_vitmatte l "Enable ViTMatte Refinement" +STARTLINE}
  use_vitmatte false
 
- addUserKnob {6 show_trimap_overlay l "Show Trimap Overlay" +STARTLINE}
+ addUserKnob {26 vitmatte_info l "" +STARTLINE T "<small>ViTMatte refines SAM's coarse mask into production-quality\nsoft alpha with natural edge transitions (hair, fur, glass).\n<b>Inner Edge</b> = how far inside the boundary to soften.\n<b>Outer Edge</b> = how far outside to reach for soft transitions.\nfinal_binary_sharp is auto-disabled when ViTMatte is on.</small>"}
+
+ addUserKnob {7 trimap_erode_radius l "Inner Edge (px)" R 0 50}
+ trimap_erode_radius 5
+
+ addUserKnob {7 trimap_dilate_radius l "Outer Edge (px)" R 0 50}
+ trimap_dilate_radius 15
+
+ addUserKnob {6 show_trimap_overlay l "Save Trimap Debug" +STARTLINE}
  show_trimap_overlay false
 
- addUserKnob {7 trimap_overlay_opacity l "Trimap Overlay Opacity" R 0 1}
+ addUserKnob {7 trimap_overlay_opacity l "Trimap Overlay Opacity" +HIDDEN R 0 1}
  trimap_overlay_opacity 0.6
-
- addUserKnob {7 trimap_erode_radius l "Trimap Erode Radius" R 0 200}
- trimap_erode_radius 3
-
- addUserKnob {7 trimap_dilate_radius l "Trimap Dilate Radius" R 0 200}
- trimap_dilate_radius 10
 
  addUserKnob {20 endGroup_vitmatte l endGroup n -1}
 

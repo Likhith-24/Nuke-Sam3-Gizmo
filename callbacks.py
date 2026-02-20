@@ -565,8 +565,9 @@ def _apply_visibility(node) -> None:
     vitmatte_knob = node.knob("use_vitmatte")
     if vitmatte_knob:
         vitmatte_on = bool(vitmatte_knob.value())
-        for k_name in ("show_trimap_overlay", "trimap_overlay_opacity",
-                        "trimap_erode_radius", "trimap_dilate_radius"):
+        for k_name in ("vitmatte_info", "trimap_erode_radius",
+                        "trimap_dilate_radius", "show_trimap_overlay",
+                        "trimap_overlay_opacity"):
             kn = node.knob(k_name)
             if kn:
                 kn.setVisible(vitmatte_on)

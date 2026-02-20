@@ -283,16 +283,21 @@ def image_from_nuke_node(node) -> np.ndarray:
 def refine_mask_with_vitmatte(
     image: np.ndarray,
     coarse_mask: np.ndarray,
-    trimap_width: int = 10,
-    erode_radius: int = 2,
-    dilate_radius: int = 2
+    erode_radius: int = 5,
+    dilate_radius: int = 15,
+    crop_padding: float = 20.0,
 ) -> np.ndarray:
-    """Refine a coarse mask using ViTMatte for high-quality alpha matte."""
+    """Refine a coarse mask using ViTMatte for production-quality alpha.
+
+    Uses cropped refinement — ViTMatte only processes the masked region
+    plus *crop_padding* %, giving more detail resolution on the actual
+    edges (hair, fur, translucency) where it matters most.
+    """
     from . import vitmatte_refiner
     refiner = vitmatte_refiner.get_refiner()
-    return refiner.refine(
+    return refiner.refine_with_crop(
         image, coarse_mask,
-        trimap_width=trimap_width,
+        padding_percent=crop_padding,
         erode_radius=erode_radius,
         dilate_radius=dilate_radius,
     )
@@ -632,22 +637,57 @@ def _refine_and_write(
     use_vitmatte = params.get("use_vitmatte", False)
 
     if use_vitmatte:
-        erode_radius  = int(params.get("trimap_erode_radius", 3))
-        dilate_radius = int(params.get("trimap_dilate_radius", 10))
-        trimap_width  = max(erode_radius, dilate_radius)
-        if trimap_width > 0:
-            alpha_matte = refine_mask_with_vitmatte(
-                image, coarse_mask, trimap_width, erode_radius, dilate_radius,
-            )
-        else:
-            alpha_matte = coarse_mask.astype(np.float32)
+        erode_radius  = int(params.get("trimap_erode_radius", 5))
+        dilate_radius = int(params.get("trimap_dilate_radius", 15))
+        crop_padding  = float(params.get("crop_padding", 20.0))
 
-        # Normalize ViTMatte's soft output so the core reaches 1.0
+        alpha_matte = refine_mask_with_vitmatte(
+            image, coarse_mask,
+            erode_radius=erode_radius,
+            dilate_radius=dilate_radius,
+            crop_padding=crop_padding,
+        )
+
+        # Normalize: ensure the FG core reaches 1.0
         alpha_max = float(alpha_matte.max())
         if 0.01 < alpha_max < 0.95:
             alpha_matte = np.clip(alpha_matte / alpha_max, 0.0, 1.0)
-        elif alpha_max >= 0.95:
+        else:
             alpha_matte = np.clip(alpha_matte, 0.0, 1.0)
+
+        # Clean near-zero noise in definite BG areas
+        alpha_matte[alpha_matte < 0.004] = 0.0
+
+        # CRITICAL: ViTMatte produces proper soft alpha with natural
+        # edge transitions — final_binary_sharp MUST be disabled or
+        # it converts the soft matte back to hard 0/1 and destroys
+        # all the edge quality ViTMatte just computed.
+        params = dict(params)  # local copy — don't mutate original
+        params["final_binary_sharp"] = False
+
+        print(f"[H2 SamViT] ViTMatte refinement applied "
+              f"(inner={erode_radius}px, outer={dilate_radius}px)")
+
+        # Debug: save trimap to disk if requested
+        if params.get("show_trimap_overlay", False):
+            try:
+                import tempfile
+                from . import vitmatte_refiner
+                refiner = vitmatte_refiner.get_refiner()
+                trimap = refiner.create_trimap(
+                    coarse_mask,
+                    erode_radius=erode_radius,
+                    dilate_radius=dilate_radius,
+                )
+                trimap_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"h2_samvit_trimap_{node.name()}.png",
+                )
+                import cv2
+                cv2.imwrite(trimap_path, trimap)
+                print(f"[H2 SamViT] Trimap debug saved \u2192 {trimap_path}")
+            except Exception:
+                pass
     else:
         # Pure binary mask — matches ComfyUI-SAM2/SAM3 behaviour.
         # Alpha is strictly 0.0 or 1.0 and cannot be affected by grading.
