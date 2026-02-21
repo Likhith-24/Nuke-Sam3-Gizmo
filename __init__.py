@@ -48,12 +48,20 @@ def register():
     # Register knob-changed handlers
     from . import callbacks  # noqa: F811
 
-    # Install viewer click handler (Ctrl+Click to place points/bbox)
+    # Install viewer click handler (plain left-click to place points/bbox)
     try:
         from . import viewer_events
         viewer_events.install()
     except Exception as _e:
         print(f"[H2_SamViT_Gizmo] Viewer click handler not installed: {_e}")
+
+    # Install Qt viewer overlay (ONYX-style crosshairs / bbox)
+    try:
+        from . import viewer_overlay
+        if not viewer_overlay.install():
+            print("[H2_SamViT_Gizmo] Qt overlay deferred (viewer not ready)")
+    except Exception as _e:
+        print(f"[H2_SamViT_Gizmo] Qt overlay not installed: {_e}")
 
     print(f"[H2_SamViT_Gizmo] Registered v{__version__}")
 

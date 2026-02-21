@@ -68,13 +68,19 @@ def toggle_mode(node, mode: str) -> None:
     if current == mode:
         exit_edit_mode(node)
     else:
-        # Ensure overlay is ready (safe here — button context)
+        set_edit_mode(node, mode)
+        # Render overlays immediately for visual feedback
         try:
             from . import ui_overlay
-            ui_overlay.initialize_overlay(node)
+            ui_overlay.render_overlay(node)
+        except Exception as e:
+            print(f"[H2 SamViT] PIL overlay render error: {e}")
+        try:
+            from . import viewer_overlay
+            viewer_overlay.set_node(node)
+            viewer_overlay.repaint()
         except Exception:
             pass
-        set_edit_mode(node, mode)
         print(f"[H2 SamViT] Entered {mode.upper()} mode \u2014 click in viewer")
 
 
@@ -84,6 +90,11 @@ def exit_edit_mode(node) -> None:
     set_edit_mode(node, "")
     if was:
         print("[H2 SamViT] Edit mode exited")
+    try:
+        from . import viewer_overlay
+        viewer_overlay.repaint()
+    except Exception:
+        pass
 
 
 def update_mode_status(node, mode: str) -> None:
@@ -98,29 +109,40 @@ def update_mode_status(node, mode: str) -> None:
 #  Point handle visibility
 # ─────────────────────────────────────────────────────────────────────
 
-def _update_point_visibility(node) -> None:
-    """Show/hide each XY crosshair handle based on its enabled flag.
+# Off-screen position used for disabled/unused XY handles.
+# The crosshair handle is always registered with the viewer,
+# but positioned far outside the viewport so it's invisible.
+_OFF_SCREEN = [-10000, -10000]
 
-    This makes the crosshair handles appear/disappear in the Viewer
-    when points are added or removed — providing the green/red dot
-    feedback the user expects.
+
+def _update_point_visibility(node) -> None:
+    """Ensure disabled points sit at _OFF_SCREEN.
+
+    We NEVER use setVisible/setFlag/clearFlag on the XY knobs.
+    Nuke's viewer always renders handles for non-hidden XY knobs.
+    We control visibility purely by moving the position off-screen.
     """
     for i in range(1, MAX_POINTS + 1):
         idx = f"{i:02d}"
         pos_knob = node.knob(f"point_{idx}")
         enabled_knob = node.knob(f"point_{idx}_enabled")
         if pos_knob and enabled_knob:
-            pos_knob.setVisible(bool(enabled_knob.value()))
+            if not enabled_knob.value():
+                # Disabled point → move off-screen so handle isn't visible
+                x, y = pos_knob.value()
+                if x != _OFF_SCREEN[0] or y != _OFF_SCREEN[1]:
+                    pos_knob.setValue(_OFF_SCREEN)
 
 
 def _update_bbox_visibility(node) -> None:
-    """Show/hide bounding box XY handles based on bbox_enabled."""
+    """Move bbox handles off-screen when disabled."""
     bbox_enabled = node.knob("bbox_enabled")
     show = bool(bbox_enabled.value()) if bbox_enabled else False
-    for knob_name in ("bbox_top_left", "bbox_bottom_right"):
-        k = node.knob(knob_name)
-        if k:
-            k.setVisible(show)
+    if not show:
+        for knob_name in ("bbox_top_left", "bbox_bottom_right"):
+            k = node.knob(knob_name)
+            if k:
+                k.setValue(_OFF_SCREEN)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -191,10 +213,9 @@ def delete_point(node, point_index: int) -> bool:
     enabled_knob = node.knob(f"point_{idx}_enabled")
 
     if pos_knob and fg_knob and enabled_knob:
-        pos_knob.setValue([0, 0])
+        pos_knob.setValue(_OFF_SCREEN)
         fg_knob.setValue(True)
         enabled_knob.setValue(False)
-        _update_point_visibility(node)
         return True
     return False
 
@@ -208,10 +229,9 @@ def clear_all_points(node) -> None:
         fg_knob = node.knob(f"point_{idx}_fg")
         enabled_knob = node.knob(f"point_{idx}_enabled")
         if pos_knob and fg_knob and enabled_knob:
-            pos_knob.setValue([0, 0])
+            pos_knob.setValue(_OFF_SCREEN)
             fg_knob.setValue(True)
             enabled_knob.setValue(False)
-    _update_point_visibility(node)
     # Full overlay render — safe here (button callback context).
     try:
         from . import ui_overlay
@@ -228,23 +248,21 @@ def clear_box(node) -> None:
     tl_knob = node.knob("bbox_top_left")
     br_knob = node.knob("bbox_bottom_right")
     if tl_knob:
-        tl_knob.setValue([0, 0])
+        tl_knob.setValue(_OFF_SCREEN)
     if br_knob:
-        br_knob.setValue([0, 0])
+        br_knob.setValue(_OFF_SCREEN)
     bbox_knob = node.knob("bbox_enabled")
     if bbox_knob:
         bbox_knob.setValue(0)
-    _update_bbox_visibility(node)
 
     # Clear negative bbox
     for kn in ("neg_bbox_top_left", "neg_bbox_bottom_right"):
         k = node.knob(kn)
         if k:
-            k.setValue([0, 0])
+            k.setValue(_OFF_SCREEN)
     neg_en = node.knob("neg_bbox_enabled")
     if neg_en:
         neg_en.setValue(0)
-    _update_neg_bbox_visibility(node)
 
     # Full overlay render — safe here (button callback context).
     try:
@@ -270,7 +288,10 @@ def get_bbox(node) -> Optional[Tuple[float, float, float, float]]:
     x1, y1 = tl_knob.value()
     x2, y2 = br_knob.value()
 
-    # Check if bbox is empty
+    # Check if bbox is empty (off-screen sentinel or zero)
+    if (x1 <= _OFF_SCREEN[0] or y1 <= _OFF_SCREEN[1]
+            or x2 <= _OFF_SCREEN[0] or y2 <= _OFF_SCREEN[1]):
+        return None
     if x1 == x2 == y1 == y2 == 0:
         return None
 
@@ -294,8 +315,6 @@ def set_bbox(node, x1: float, y1: float, x2: float, y2: float) -> None:
     if bbox_knob:
         bbox_knob.setValue(1)
 
-    _update_bbox_visibility(node)
-
 
 def get_neg_bbox(node) -> Optional[Tuple[float, float, float, float]]:
     """Get negative bounding box as (x1, y1, x2, y2) or None."""
@@ -310,6 +329,9 @@ def get_neg_bbox(node) -> Optional[Tuple[float, float, float, float]]:
 
     x1, y1 = tl_knob.value()
     x2, y2 = br_knob.value()
+    if (x1 <= _OFF_SCREEN[0] or y1 <= _OFF_SCREEN[1]
+            or x2 <= _OFF_SCREEN[0] or y2 <= _OFF_SCREEN[1]):
+        return None
     if x1 == x2 == y1 == y2 == 0:
         return None
 
@@ -339,11 +361,10 @@ def clear_neg_box(node) -> None:
     for kn in ("neg_bbox_top_left", "neg_bbox_bottom_right"):
         k = node.knob(kn)
         if k:
-            k.setValue([0, 0])
+            k.setValue(_OFF_SCREEN)
     en = node.knob("neg_bbox_enabled")
     if en:
         en.setValue(0)
-    _update_neg_bbox_visibility(node)
     try:
         from . import ui_overlay
         ui_overlay.render_overlay(node)
@@ -353,13 +374,16 @@ def clear_neg_box(node) -> None:
 
 
 def _update_neg_bbox_visibility(node) -> None:
-    """Show/hide negative bbox handles."""
+    """Move negative bbox handles off-screen when disabled (SAM3 only)."""
+    family_knob = node.knob("model_family")
+    is_sam3 = family_knob and family_knob.value() == "SAM3"
     en = node.knob("neg_bbox_enabled")
-    show = bool(en.value()) if en else False
-    for kn in ("neg_bbox_top_left", "neg_bbox_bottom_right"):
-        k = node.knob(kn)
-        if k:
-            k.setVisible(show)
+    show = is_sam3 and (bool(en.value()) if en else False)
+    if not show:
+        for kn in ("neg_bbox_top_left", "neg_bbox_bottom_right"):
+            k = node.knob(kn)
+            if k:
+                k.setValue(_OFF_SCREEN)
 
 
 def find_closest_point(node, x: float, y: float, threshold: float = 20.0) -> Optional[int]:
@@ -401,6 +425,22 @@ def download_model_action(node) -> None:
     from . import model_manager
 
     family = node.knob("model_family").value()
+
+    # SeC-4B requires a separate manual setup
+    if family == "SEC-4B":
+        nuke.message(
+            "SeC-4B (Segment by Concept) requires additional setup:\n\n"
+            "1. Clone the repo:\n"
+            "   git clone https://github.com/OpenIXCLab/SeC\n\n"
+            "2. Install dependencies:\n"
+            "   pip install transformers peft timm hydra-core\n\n"
+            "3. Download model (~7.35 GB) from HuggingFace:\n"
+            "   OpenIXCLab/SeC-4B\n\n"
+            "SeC-4B excels at video object segmentation with\n"
+            "concept re-identification across scene changes.\n"
+            "For single-image segmentation, SAM2 or SAM3 is recommended."
+        )
+        return
 
     if family == "SAM3":
         version, size = "3.0", "Default"
@@ -447,6 +487,12 @@ def update_model_status(node) -> None:
 
     family = node.knob("model_family").value()
 
+    if family == "SEC-4B":
+        status_knob = node.knob("model_status")
+        if status_knob:
+            status_knob.setValue("Requires manual setup (see Download)")
+        return
+
     if family == "SAM3":
         version, size = "3.0", "Default"
     else:
@@ -473,7 +519,6 @@ def reset_all_parameters(node) -> None:
         "model_size": "Large",
         "model_precision": "bf16",
         "enable_edit": True,
-        "draw_box": False,
         "bbox_enabled": 0,
         "use_vitmatte": False,
         "input_threshold": 100,
@@ -544,12 +589,16 @@ def _apply_visibility(node) -> None:
             if kn:
                 kn.setVisible(is_sam2)
 
+        # Precision is available for SAM2 and SAM3
+        prec_knob = node.knob("model_precision")
+        if prec_knob:
+            prec_knob.setVisible(is_sam2 or is_sam3)
+
     # Negative bbox — SAM3 only (SAM2/SEC don't support it)
     neg_bbox_btn = node.knob("draw_neg_bbox_btn")
     if neg_bbox_btn:
         neg_bbox_btn.setVisible(is_sam3)
-    for k_name in ("neg_bbox_top_left", "neg_bbox_bottom_right",
-                    "neg_bbox_enabled", "neg_bbox_color",
+    for k_name in ("neg_bbox_enabled", "neg_bbox_color",
                     "bbox_neg_label"):
         kn = node.knob(k_name)
         if kn:
@@ -585,16 +634,9 @@ def _apply_visibility(node) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 def on_create(node) -> None:
-    """onCreate handler — set initial knob visibility and overlay."""
+    """onCreate handler — set initial knob visibility."""
     _apply_visibility(node)
     update_model_status(node)
-    # Pre-initialise OverlaySource as a Read node so that
-    # refresh_overlay_safe() works from knobChanged later.
-    try:
-        from . import ui_overlay
-        ui_overlay.initialize_overlay(node)
-    except Exception:
-        pass
 
 
 def on_knob_changed(node, knob) -> None:
@@ -635,35 +677,6 @@ def _on_knob_changed_inner(node, knob) -> None:
     # ── ViTMatte toggle: show/hide trimap knobs ──
     if knob_name == "use_vitmatte":
         _apply_visibility(node)
-
-    # ── Draw Box → sync bbox_enabled + update handles ──
-    if knob_name == "draw_box":
-        bbox_knob = node.knob("bbox_enabled")
-        if knob.value():
-            if bbox_knob:
-                bbox_knob.setValue(1)
-            # If the box is empty, initialise the handles at a sensible
-            # default (centre-quarter of the frame) so the user can
-            # immediately see and drag them in the Viewer.
-            tl = node.knob("bbox_top_left")
-            br = node.knob("bbox_bottom_right")
-            if tl and br:
-                tlx, tly = tl.value()
-                brx, bry = br.value()
-                if tlx == 0 and tly == 0 and brx == 0 and bry == 0:
-                    inp = node.input(0)
-                    if inp:
-                        fmt = inp.format()
-                        w, h = fmt.width(), fmt.height()
-                    else:
-                        w, h = 1920, 1080
-                    tl.setValue([w * 0.25, h * 0.25])
-                    br.setValue([w * 0.75, h * 0.75])
-        else:
-            if bbox_knob:
-                bbox_knob.setValue(0)
-        _update_bbox_visibility(node)
-        _try_refresh_overlay(node)
 
     # ── bbox_enabled changed directly → update handles ──
     if knob_name == "bbox_enabled":
@@ -714,16 +727,20 @@ def _on_knob_changed_inner(node, knob) -> None:
 
 
 def _try_refresh_overlay(node) -> None:
-    """Re-render the overlay after a point/bbox drag.
+    """Re-render overlays after a point/bbox change.
 
-    Safe to call from ``knobChanged`` because it does NOT use
-    ``node.begin()``/``node.end()``.  Only works after
-    ``initialize_overlay`` (in ``on_create``) has converted
-    OverlaySource from a Constant to a Read node.
+    Triggers both the PIL overlay (composited in image space) and the
+    Qt overlay (drawn directly on the Viewer widget).
     """
     try:
         from . import ui_overlay
         ui_overlay.refresh_overlay_safe(node)
+    except Exception:
+        pass
+    try:
+        from . import viewer_overlay
+        viewer_overlay.set_node(node)
+        viewer_overlay.repaint()
     except Exception:
         pass
 
@@ -803,6 +820,17 @@ def run_inference(node) -> None:
 
     if not node.knob("enable_edit").value():
         nuke.message("Enable Edit is disabled. Enable it to run inference.")
+        return
+
+    # SeC-4B is not yet integrated for inference
+    family = node.knob("model_family").value()
+    if family == "SEC-4B":
+        nuke.message(
+            "SeC-4B inference is not yet integrated.\n\n"
+            "SeC-4B is a video object segmentation model that\n"
+            "requires the full OpenIXCLab/SeC codebase.\n\n"
+            "For single-image segmentation, please use SAM2 or SAM3."
+        )
         return
 
     pipeline_mode = node.knob("pipeline_mode").value()

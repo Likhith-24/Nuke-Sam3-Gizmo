@@ -76,10 +76,24 @@ class _ViewerClickHandler(QtCore.QObject):
         if not _is_viewer_gl(obj):
             return False
 
+        # ── Lazy-install the Qt overlay on the first viewer event ──
+        try:
+            from H2_SamViT_Gizmo import viewer_overlay
+            viewer_overlay.ensure_installed()
+        except Exception:
+            pass
+
         # ── Must have an active H2 node with a mode ──
         node = _get_active_h2_node()
         if node is None:
             return False
+
+        # Tell the overlay which node to draw handles for
+        try:
+            from H2_SamViT_Gizmo import viewer_overlay as _vo
+            _vo.set_node(node)
+        except Exception:
+            pass
 
         from H2_SamViT_Gizmo import callbacks
         mode = callbacks.get_edit_mode(node)
@@ -124,6 +138,7 @@ class _ViewerClickHandler(QtCore.QObject):
         if callbacks.add_point(node, x, y, is_foreground=is_fg):
             print(f"[H2 SamViT] {kind} point at ({int(x)}, {int(y)})")
             _safe_overlay_refresh(node)
+            _qt_repaint()
 
     def _on_bbox_click(self, node, x, y):
         from H2_SamViT_Gizmo import callbacks
@@ -136,14 +151,12 @@ class _ViewerClickHandler(QtCore.QObject):
             x1, y1 = self._bbox_corner1
             callbacks.set_bbox(node, x1, y1, x, y)
             self._bbox_corner1 = None
-            db = node.knob("draw_box")
-            if db:
-                db.setValue(True)
             callbacks.exit_edit_mode(node)
             print(f"[H2 SamViT] Pos bbox set: "
                   f"({int(min(x1, x))},{int(min(y1, y))}) → "
                   f"({int(max(x1, x))},{int(max(y1, y))})")
             _safe_overlay_refresh(node)
+            _qt_repaint()
 
     def _on_neg_bbox_click(self, node, x, y):
         from H2_SamViT_Gizmo import callbacks
@@ -161,6 +174,7 @@ class _ViewerClickHandler(QtCore.QObject):
                   f"({int(min(x1, x))},{int(min(y1, y))}) → "
                   f"({int(max(x1, x))},{int(max(y1, y))})")
             _safe_overlay_refresh(node)
+            _qt_repaint()
 
     def _on_delete_nearest(self, node, x, y):
         from H2_SamViT_Gizmo import callbacks
@@ -169,6 +183,7 @@ class _ViewerClickHandler(QtCore.QObject):
             callbacks.delete_point(node, idx)
             print(f"[H2 SamViT] Deleted point {idx}")
             _safe_overlay_refresh(node)
+            _qt_repaint()
         else:
             print(f"[H2 SamViT] No point near ({int(x)}, {int(y)})")
 
@@ -178,12 +193,21 @@ class _ViewerClickHandler(QtCore.QObject):
 # ─────────────────────────────────────────────────────────────────────
 
 def _safe_overlay_refresh(node):
-    """Overlay refresh — uses full render (safe from Qt event context)."""
+    """PIL overlay refresh — safe from Qt event context (no begin/end)."""
     try:
         from H2_SamViT_Gizmo import ui_overlay
-        ui_overlay.render_overlay(node)
+        ui_overlay.refresh_overlay_safe(node)
     except Exception as e:
-        print(f"[H2 SamViT] Overlay refresh error: {e}")
+        print(f"[H2 SamViT] PIL overlay refresh error: {e}")
+
+
+def _qt_repaint():
+    """Trigger a repaint of the Qt viewer overlay."""
+    try:
+        from H2_SamViT_Gizmo import viewer_overlay
+        viewer_overlay.repaint()
+    except Exception:
+        pass
 
 
 def _get_active_h2_node():

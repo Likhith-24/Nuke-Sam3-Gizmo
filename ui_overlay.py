@@ -1,35 +1,28 @@
-# ui_overlay.py  —  Viewer overlay for H2 SamViT
+# ui_overlay.py — Colour overlay for H2 SamViT
 #
-# Renders coloured point and bounding-box annotations into a transparent
-# PNG image and feeds it into the gizmo's internal **OverlaySource** node.
-# The gizmo's **OverlayMerge** (Merge2 / over / RGB-only) composites it
-# over the main image so the user sees green/red dots and a cyan bbox
-# directly in the Nuke Viewer — no fragile Qt overlay needed.
+# Draws lightweight colour indicators that supplement Nuke's native
+# XY-knob crosshair handles:
+#   • Coloured rings around point positions  (green = FG, red = BG)
+#   • Coloured rectangle outline for bbox / neg-bbox
 #
-# Call ``render_overlay(node)`` whenever points, bbox, or appearance
-# knobs change.  Call ``clear_overlay(node)`` to remove the overlay.
-# ─────────────────────────────────────────────────────────────────────
+# The actual point/bbox interaction (dragging, positioning) is handled
+# entirely by Nuke's built-in type-12 XY_Knob crosshairs.
+# This module only adds colour so the user can tell FG from BG.
+#
+# OverlaySource is a Read node baked into the gizmo.  All functions
+# access it via nuke.toNode(fullName) — NO node.begin()/end() ever.
+# Safe from knobChanged, Qt event filter, and button callbacks.
 
 from __future__ import annotations
-
-import os
-import tempfile
+import os, tempfile
 from typing import Optional, Tuple
-
 import nuke
 
-
-# Temp directory for overlay PNGs
 _OVERLAY_DIR = os.path.join(tempfile.gettempdir(), "h2_samvit_overlays")
 os.makedirs(_OVERLAY_DIR, exist_ok=True)
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Colour helpers
-# ─────────────────────────────────────────────────────────────────────
-
 def _knob_rgb(node, name: str, default: Tuple[int, int, int] = (0, 255, 0)):
-    """Read a Color_Knob (type 18) and return an (R, G, B) tuple 0-255."""
     k = node.knob(name)
     if not k:
         return default
@@ -39,61 +32,51 @@ def _knob_rgb(node, name: str, default: Tuple[int, int, int] = (0, 255, 0)):
     return default
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Public API
-# ─────────────────────────────────────────────────────────────────────
+# ─── Public API ─────────────────────────────────────────────────────
 
 def render_overlay(node) -> None:
-    """(Re-)generate the coloured overlay image and update the gizmo.
-
-    Called from ``callbacks.py`` whenever points, bbox, or appearance
-    knobs change.  Writes a transparent RGBA PNG and injects it into
-    the gizmo's internal OverlaySource Read node.  The OverlayMerge
-    node composites it over the main image (RGB only — alpha is
-    preserved from CopyAlpha).
-    """
+    """Render colour overlay and push it to the gizmo's Read node."""
     path = render_overlay_image(node)
     if path is None:
         clear_overlay(node)
         return
-    _update_overlay_node(node, path)
+    _push_to_read(node, path)
+
+
+def refresh_overlay_safe(node) -> None:
+    """Same as render_overlay — safe from any context."""
+    path = render_overlay_image(node)
+    if path:
+        _push_to_read(node, path)
 
 
 def render_overlay_image(node) -> Optional[str]:
-    """Render the coloured overlay PNG and return its file path.
-
-    Returns ``None`` if there are no points or bbox to draw, or if
-    Pillow is not available.  This function does NOT touch the Nuke
-    node graph and is therefore safe to call from ``knobChanged``.
-    """
+    """Draw colour rings + bbox outlines to a transparent PNG."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except ImportError:
-        return None  # Pillow not available — skip overlay
-
-    # ── Input dimensions ────────────────────────────────────────
-    input_node = node.input(0)
-    if not input_node:
+        print("[H2 SamViT] PIL not available — colour overlay disabled")
         return None
-    fmt = input_node.format()
+
+    inp = node.input(0)
+    if not inp:
+        return None
+    fmt = inp.format()
     w, h = fmt.width(), fmt.height()
     if w < 1 or h < 1:
         return None
 
-    # ── Collect prompts ─────────────────────────────────────────
     from . import callbacks
-    points = callbacks.get_enabled_points(node)
-    bbox = callbacks.get_bbox(node)
+    points   = callbacks.get_enabled_points(node)
+    bbox     = callbacks.get_bbox(node)
     neg_bbox = callbacks.get_neg_bbox(node)
-
     if not points and not bbox and not neg_bbox:
         return None
 
-    # ── Appearance knobs ────────────────────────────────────────
-    fg_rgb  = _knob_rgb(node, "fg_point_color", (0, 255, 0))
-    bg_rgb  = _knob_rgb(node, "bg_point_color", (255, 0, 0))
-    box_rgb = _knob_rgb(node, "bbox_color",     (0, 167, 255))
-    neg_box_rgb = _knob_rgb(node, "neg_bbox_color", (255, 77, 0))
+    fg_rgb      = _knob_rgb(node, "fg_point_color",  (0, 255, 0))
+    bg_rgb      = _knob_rgb(node, "bg_point_color",  (255, 0, 0))
+    box_rgb     = _knob_rgb(node, "bbox_color",      (0, 167, 255))
+    neg_box_rgb = _knob_rgb(node, "neg_bbox_color",  (255, 77, 0))
 
     scale = 1.0
     sk = node.knob("overlay_scale")
@@ -103,296 +86,112 @@ def render_overlay_image(node) -> Optional[str]:
         except Exception:
             pass
 
-    show_labels = True
-    lk = node.knob("show_point_labels")
-    if lk:
-        show_labels = bool(lk.value())
-
-    # ── Create transparent RGBA image ───────────────────────────
     img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    radius = max(4, int(10 * scale))
-    half   = max(2, int(radius * 0.5))
-    lw     = max(1, int(2 * scale))
-
-    # ── Draw bounding box ───────────────────────────────────────
-    if bbox:
-        bx1, by1, bx2, by2 = bbox
-        # Nuke Y-up → image Y-down
-        iy_top = int(h - by2)
-        iy_bot = int(h - by1)
-        ix_left, ix_right = int(bx1), int(bx2)
-
-        # Semi-transparent fill
-        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
-                       fill=(*box_rgb, 25))
-        # Solid border
-        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
-                       outline=(*box_rgb, 200),
-                       width=max(1, int(2 * scale)))
-        # Corner handles
-        hs = max(3, int(6 * scale))
-        for cx, cy in [(ix_left, iy_top), (ix_right, iy_top),
-                       (ix_right, iy_bot), (ix_left, iy_bot)]:
-            draw.rectangle([cx - hs, cy - hs, cx + hs, cy + hs],
-                           fill=(*box_rgb, 230))
-
-    # ── Draw negative bounding box (SAM3 exclude region) ────────
-    if neg_bbox:
-        bx1, by1, bx2, by2 = neg_bbox
-        iy_top = int(h - by2)
-        iy_bot = int(h - by1)
-        ix_left, ix_right = int(bx1), int(bx2)
-
-        # Semi-transparent fill (red-ish tint)
-        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
-                       fill=(*neg_box_rgb, 30))
-        # Dashed-style border (solid for now — PIL has no dashes)
-        draw.rectangle([ix_left, iy_top, ix_right, iy_bot],
-                       outline=(*neg_box_rgb, 200),
-                       width=max(1, int(2 * scale)))
-        # Corner handles
-        hs = max(3, int(6 * scale))
-        for cx, cy in [(ix_left, iy_top), (ix_right, iy_top),
-                       (ix_right, iy_bot), (ix_left, iy_bot)]:
-            draw.rectangle([cx - hs, cy - hs, cx + hs, cy + hs],
-                           fill=(*neg_box_rgb, 230))
-        # Draw an × across the box to indicate "exclude"
-        draw.line([(ix_left, iy_top), (ix_right, iy_bot)],
-                  fill=(*neg_box_rgb, 120), width=max(1, int(1.5 * scale)))
-        draw.line([(ix_right, iy_top), (ix_left, iy_bot)],
-                  fill=(*neg_box_rgb, 120), width=max(1, int(1.5 * scale)))
-
-    # ── Draw points ─────────────────────────────────────────────
-    # Try to load a font once for labels
-    _font = None
-    if show_labels:
-        try:
-            fsize = max(10, int(13 * scale))
-            for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-                         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"):
-                if os.path.isfile(path):
-                    _font = ImageFont.truetype(path, fsize)
-                    break
-            if _font is None:
-                _font = ImageFont.load_default()
-        except Exception:
-            _font = None
+    # ── Coloured rings around each point ────────────────────────
+    # Ring sits around the native XY crosshair — colour = FG/BG.
+    ring_r = max(10, int(min(w, h) * 0.012 * scale))
+    ring_w = max(3, int(ring_r * 0.35))
 
     for pt in points:
         px = int(pt["x"])
-        py = int(h - pt["y"])  # Nuke Y-up → image Y-down
+        py = int(h - pt["y"])          # Nuke Y-up → image Y-down
         col = fg_rgb if pt["is_foreground"] else bg_rgb
+        draw.ellipse(
+            [px - ring_r, py - ring_r, px + ring_r, py + ring_r],
+            outline=(*col, 220), width=ring_w,
+        )
 
-        # Filled circle with white outline
-        draw.ellipse([px - radius, py - radius, px + radius, py + radius],
-                     fill=(*col, 200),
-                     outline=(255, 255, 255, 230),
-                     width=max(1, int(1.5 * scale)))
+    # ── Positive bbox outline ───────────────────────────────────
+    if bbox:
+        x1, y1, x2, y2 = bbox
+        iy_top, iy_bot = int(h - y2), int(h - y1)
+        bw = max(2, int(3 * scale))
+        draw.rectangle(
+            [int(x1), iy_top, int(x2), iy_bot],
+            outline=(*box_rgb, 220), width=bw,
+        )
 
-        # +  (FG) or –  (BG) symbol
-        draw.line([(px - half, py), (px + half, py)],
-                  fill=(255, 255, 255, 255), width=lw)
-        if pt["is_foreground"]:
-            draw.line([(px, py - half), (px, py + half)],
-                      fill=(255, 255, 255, 255), width=lw)
+    # ── Negative bbox outline (SAM3) ────────────────────────────
+    if neg_bbox:
+        x1, y1, x2, y2 = neg_bbox
+        iy_top, iy_bot = int(h - y2), int(h - y1)
+        bw = max(2, int(3 * scale))
+        ix1, ix2 = int(x1), int(x2)
+        draw.rectangle([ix1, iy_top, ix2, iy_bot],
+                       outline=(*neg_box_rgb, 220), width=bw)
+        draw.line([(ix1, iy_top), (ix2, iy_bot)],
+                  fill=(*neg_box_rgb, 120), width=2)
+        draw.line([(ix2, iy_top), (ix1, iy_bot)],
+                  fill=(*neg_box_rgb, 120), width=2)
 
-        # Numeric index label
-        if show_labels and _font is not None:
-            try:
-                draw.text((px + radius + 4, py - radius - 2),
-                          str(pt["index"]),
-                          fill=(255, 255, 255, 220), font=_font)
-            except Exception:
-                pass
-
-    # ── Save PNG (fast, minimal compression) ────────────────────
-    overlay_path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
-    img.save(overlay_path, "PNG", compress_level=1)
-
-    return overlay_path
-
-
-def refresh_overlay_safe(node) -> None:
-    """Re-render overlay and update an existing Read node.
-
-    Safe to call from ``knobChanged`` because it does NOT use
-    ``node.begin()``/``node.end()`` — it accesses the internal
-    OverlaySource node via its full hierarchical name.
-
-    Only works after the first ``render_overlay()`` call has already
-    converted OverlaySource from a Constant to a Read node.
-    """
-    path = render_overlay_image(node)
-    if path is None:
-        return
-
-    # Access the internal node via its full path — no begin/end needed.
-    try:
-        src = nuke.toNode(node.fullName() + ".OverlaySource")
-        if src and src.Class() != "Constant":
-            src["file"].setValue(path)
-            try:
-                src["reload"].execute()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def initialize_overlay(node) -> None:
-    """Pre-create OverlaySource as a Read node for live overlay updates.
-
-    Called from ``on_create`` so that ``refresh_overlay_safe()`` can
-    update the overlay from ``knobChanged`` without needing
-    ``node.begin()``/``node.end()``.
-
-    Creates a minimal transparent PNG and converts the default Constant
-    into a Read node pointing to it.  Subsequent calls to
-    ``render_overlay_image`` + ``refresh_overlay_safe`` will overwrite
-    that PNG with the real coloured overlay.
-    """
-    try:
-        from PIL import Image
-    except ImportError:
-        return  # Pillow not installed yet — skip
-
-    # Create a small transparent placeholder PNG
     path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
-    if not os.path.exists(path):
-        img = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
-        img.save(path, "PNG")
-
-    node.begin()
-    try:
-        src = nuke.toNode("OverlaySource")
-        if src and src.Class() == "Constant":
-            xp, yp = src.xpos(), src.ypos()
-            merge = nuke.toNode("OverlayMerge")
-            copy_alpha = nuke.toNode("CopyAlpha")
-
-            nuke.delete(src)
-
-            r = nuke.nodes.Read()
-            r.setName("OverlaySource")
-            r["file"].setValue(path)
-            r["raw"].setValue(True)
-            # Ensure overlay is visible at ANY timeline frame
-            r["first"].setValue(1)
-            r["last"].setValue(1)
-            r["before"].setValue("hold")
-            r["after"].setValue("hold")
-            r["on_error"].setValue("nearest frame")
-            r.setXpos(xp)
-            r.setYpos(yp)
-
-            if merge and copy_alpha:
-                merge.setInput(0, copy_alpha)
-                merge.setInput(1, r)
-    finally:
-        node.end()
+    img.save(path, "PNG", compress_level=1)
+    return path
 
 
 def clear_overlay(node) -> None:
-    """Remove any overlay — write a transparent PNG and update the Read.
-
-    Keeps OverlaySource as a Read node (does NOT revert to Constant)
-    so that ``refresh_overlay_safe()`` continues to work from
-    ``knobChanged`` callbacks.
-    """
+    """Write a transparent PNG to blank the overlay."""
     try:
         from PIL import Image
     except ImportError:
         return
-
-    # Determine dimensions from input
-    input_node = node.input(0)
-    if input_node:
-        fmt = input_node.format()
+    inp = node.input(0)
+    if inp:
+        fmt = inp.format()
         w, h = fmt.width(), fmt.height()
     else:
         w, h = 4, 4
-
-    # Write transparent PNG
     path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    img.save(path, "PNG", compress_level=1)
-
-    # Update the Read node (or create it from Constant)
-    _update_overlay_node(node, path)
+    Image.new("RGBA", (w, h), (0, 0, 0, 0)).save(path, "PNG", compress_level=1)
+    _push_to_read(node, path)
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Internal helpers
-# ─────────────────────────────────────────────────────────────────────
+def initialize_overlay(node) -> None:
+    """No-op — OverlaySource is a Read node from gizmo creation."""
+    pass
 
-def _update_overlay_node(node, path: str) -> None:
-    """Swap the OverlaySource Constant → Read (first call) or reload
-    the existing Read node (subsequent calls)."""
-    node.begin()
+
+# ─── Internal ───────────────────────────────────────────────────────
+
+def _push_to_read(node, path: str) -> None:
+    """Set the file on the gizmo's OverlaySource Read node."""
     try:
-        src        = nuke.toNode("OverlaySource")
-        merge      = nuke.toNode("OverlayMerge")
-        copy_alpha = nuke.toNode("CopyAlpha")
-
+        src = nuke.toNode(node.fullName() + ".OverlaySource")
         if src is None:
             return
-
-        if src.Class() == "Constant":
-            # First overlay — replace Constant with a Read node
-            xp, yp = src.xpos(), src.ypos()
-            nuke.delete(src)
-
-            r = nuke.nodes.Read()
-            r.setName("OverlaySource")
-            r["file"].setValue(path)
-            r["raw"].setValue(True)  # Overlay is pre-rendered data — no colorspace
-            # Ensure overlay is visible at ANY timeline frame
-            r["first"].setValue(1)
-            r["last"].setValue(1)
-            r["before"].setValue("hold")
-            r["after"].setValue("hold")
-            r["on_error"].setValue("nearest frame")
-            r.setXpos(xp)
-            r.setYpos(yp)
-
-            # Re-wire Merge inputs: B = main image, A = overlay
-            if merge and copy_alpha:
-                merge.setInput(0, copy_alpha)
-                merge.setInput(1, r)
-        else:
-            # Existing Read — just update file path and reload
-            src["file"].setValue(path)
-            try:
-                src["reload"].execute()
-            except Exception:
-                pass
-    finally:
-        node.end()
-
-    try:
-        nuke.updateUI()
-    except Exception:
-        pass
+        src["file"].setValue(path)
+        try:
+            src["raw"].setValue(True)
+        except Exception:
+            pass
+        try:
+            src["premultiplied"].setValue(False)
+        except Exception:
+            pass
+        try:
+            src["first"].setValue(1)
+            src["last"].setValue(1)
+            src["before"].setValue("hold")
+            src["after"].setValue("hold")
+        except Exception:
+            pass
+        try:
+            src["reload"].execute()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[H2 SamViT] Overlay update: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Backward-compat stubs
-# ─────────────────────────────────────────────────────────────────────
-# Old code called install() / ensure_installed() for a Qt overlay.
-# These are now harmless no-ops — the overlay is rendered into the
-# gizmo's internal node graph instead.
+# ─── Stubs ──────────────────────────────────────────────────────────
 
 def install() -> bool:
-    """No-op — overlay is now rendered via internal gizmo nodes."""
     return True
 
 def uninstall() -> None:
-    """No-op."""
     pass
 
 def ensure_installed() -> None:
-    """No-op."""
     pass

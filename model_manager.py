@@ -81,6 +81,13 @@ _SAM3: Dict[str, Any] = dict(
     mb=3290,
 )
 
+_SEC4B: Dict[str, Any] = dict(
+    file="sec-4b",
+    url="hf://OpenIXCLab/SeC-4B",
+    mb=7350,
+    note="Segment by Concept — video segmentation with MLLM re-identification",
+)
+
 # Precision dtype map
 _DTYPE = {"fp32": None, "fp16": "float16", "bf16": "bfloat16"}
 
@@ -96,6 +103,8 @@ def get_info(family: str, version: str = "2.1", size: str = "Large") -> Dict[str
         if key not in _SAM2:
             raise KeyError(f"Unknown SAM2 variant: version={version}, size={size}")
         return _SAM2[key]
+    if family == "SEC-4B":
+        return _SEC4B
     return _SAM3
 
 
