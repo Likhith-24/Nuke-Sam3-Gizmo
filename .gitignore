@@ -13,4 +13,4 @@ models/grounding_dino/
 env_config.json
 *.tmp
 *.bak
-third-party/
+third_party/
