@@ -1,10 +1,12 @@
-"""model_manager.py – SAM model registry, download helper, and builder.
+"""model_manager.py – Model registry, download helper, and builder.
 
-Supports SAM 2.0 / 2.1 (Tiny · Small · Base+ · Large) and SAM 3.
+Supports:
+  - SAM 2.0 / 2.1 (Tiny · Small · Base+ · Large) – segmentation
+  - SAM 3 – segmentation (text + point/box)
+  - MatAnyone2 – alpha matte refinement
+
 Checkpoints are stored in the ``models/`` directory next to this file.
-Config YAMLs are shipped locally in ``configs/`` — no reliance on the
-sam2 pip package's Hydra search paths.
-All models are combined with ViTMatte for production-quality alpha mattes.
+Config YAMLs are shipped locally in ``configs/``.
 """
 
 import os
@@ -88,6 +90,12 @@ _SEC4B: Dict[str, Any] = dict(
     note="Segment by Concept — video segmentation with MLLM re-identification",
 )
 
+_MATANYONE2: Dict[str, Any] = dict(
+    file="matanyone2.pth",
+    url="https://github.com/pq-yang/MatAnyone2/releases/download/v1.0.0/matanyone2.pth",
+    mb=500,
+)
+
 # Precision dtype map
 _DTYPE = {"fp32": None, "fp16": "float16", "bf16": "bfloat16"}
 
@@ -105,6 +113,8 @@ def get_info(family: str, version: str = "2.1", size: str = "Large") -> Dict[str
         return _SAM2[key]
     if family == "SEC-4B":
         return _SEC4B
+    if family == "MatAnyone2":
+        return _MATANYONE2
     return _SAM3
 
 
@@ -369,3 +379,53 @@ def build_sam3_model(
 
     print("[H2 SamViT] SAM3 ready.")
     return model
+
+
+# ────────────────────────────────────────────────────────────────────
+#  MatAnyone2 builder
+# ────────────────────────────────────────────────────────────────────
+
+def build_matanyone2(device=None):
+    """Build and return a MatAnyone2 model + config for InferenceCore.
+
+    Returns (model, cfg) tuple.
+    """
+    import torch
+
+    device = device or _get_device()
+
+    cp = checkpoint_path("MatAnyone2")
+    if not cp.exists():
+        download("MatAnyone2")
+
+    print(f"[H2 SamViT] Loading MatAnyone2 on {device} …")
+
+    # Add third_party paths so matanyone2 package is importable
+    tp_dir = PACKAGE_DIR / "third_party" / "MatAnyone2"
+    tp_str = str(tp_dir)
+    if tp_str not in sys.path:
+        sys.path.insert(0, tp_str)
+
+    from matanyone2.utils.get_default_model import get_matanyone2_model
+
+    model = get_matanyone2_model(str(cp), device=device)
+
+    # Build a minimal config for InferenceCore
+    from omegaconf import OmegaConf
+    cfg = OmegaConf.create({
+        "mem_every": 5,
+        "max_mem_frames": 5,
+        "chunk_size": -1,
+        "max_internal_size": -1,
+        "stagger_updates": 5,
+        "top_k": 30,
+    })
+
+    if device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    print("[H2 SamViT] MatAnyone2 ready.")
+    return model, cfg

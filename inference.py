@@ -1,5 +1,10 @@
-# inference.py - SAM3 + ViTMatte inference engine for H2 SamViT
-# Handles model loading, inference, and result processing
+# inference.py — SAM3/SAM2 segmentation + MatAnyone2 alpha matting engine
+#
+# Pipeline:
+#   1. SAM3 or SAM2 produces a coarse binary mask from point/box/text prompts
+#   2. MatAnyone2 refines it into production-quality soft alpha
+#   3. Post-processing (shrink/grow, feather, offset, levels)
+#   4. Mask written to gizmo's internal Read node
 
 import os
 import numpy as np
@@ -280,27 +285,13 @@ def image_from_nuke_node(node) -> np.ndarray:
             pass
 
 
-def refine_mask_with_vitmatte(
+def refine_mask_with_matanyone2(
     image: np.ndarray,
     coarse_mask: np.ndarray,
-    erode_radius: int = 5,
-    dilate_radius: int = 15,
-    crop_padding: float = 20.0,
 ) -> np.ndarray:
-    """Refine a coarse mask using ViTMatte for production-quality alpha.
-
-    Uses cropped refinement — ViTMatte only processes the masked region
-    plus *crop_padding* %, giving more detail resolution on the actual
-    edges (hair, fur, translucency) where it matters most.
-    """
-    from . import vitmatte_refiner
-    refiner = vitmatte_refiner.get_refiner()
-    return refiner.refine_with_crop(
-        image, coarse_mask,
-        padding_percent=crop_padding,
-        erode_radius=erode_radius,
-        dilate_radius=dilate_radius,
-    )
+    """Refine a coarse mask using MatAnyone2 for production-quality alpha."""
+    from . import matanyone2_refiner
+    return matanyone2_refiner.refine_single_frame(image, coarse_mask)
 
 
 def run_point_bbox_inference(
@@ -613,40 +604,24 @@ def _refine_and_write(
 ) -> None:
     """Shared refinement / post-processing / write-back pipeline.
 
-    Alpha handling follows the same pattern as ComfyUI-SAM2 / SAM3:
-    SAM's ``predict()`` returns boolean masks — ``masks > threshold``
-    — which are pure binary (0 or 1).  We keep them binary by default
-    so the resulting alpha channel is **always** pure white (1.0) or
-    pure black (0.0) and is never affected by upstream colour grading.
-
-    ViTMatte soft-alpha refinement is available behind the
-    ``use_vitmatte`` toggle for compositing workflows that need it.
+    If MatAnyone2 is enabled, refines the coarse binary mask into a
+    soft alpha matte. Otherwise, produces a pure binary (0/1) mask.
     """
     import nuke
-    from . import callbacks
 
     # Guarantee the mask is 2-D (H, W).
     while coarse_mask.ndim > 2:
         coarse_mask = coarse_mask.squeeze(0)
 
-    params = callbacks.get_inference_params(node)
+    params = _get_output_params(node)
 
     coarse_mask = preprocess_mask(coarse_mask, params)
 
-    # ── ViTMatte refinement (optional — OFF by default) ──
-    use_vitmatte = params.get("use_vitmatte", False)
+    # ── MatAnyone2 refinement (default ON) ──
+    use_ma2 = node.knob("use_matanyone2").value()
 
-    if use_vitmatte:
-        erode_radius  = int(params.get("trimap_erode_radius", 5))
-        dilate_radius = int(params.get("trimap_dilate_radius", 15))
-        crop_padding  = float(params.get("crop_padding", 20.0))
-
-        alpha_matte = refine_mask_with_vitmatte(
-            image, coarse_mask,
-            erode_radius=erode_radius,
-            dilate_radius=dilate_radius,
-            crop_padding=crop_padding,
-        )
+    if use_ma2:
+        alpha_matte = refine_mask_with_matanyone2(image, coarse_mask)
 
         # Normalize: ensure the FG core reaches 1.0
         alpha_max = float(alpha_matte.max())
@@ -658,58 +633,27 @@ def _refine_and_write(
         # Clean near-zero noise in definite BG areas
         alpha_matte[alpha_matte < 0.004] = 0.0
 
-        # CRITICAL: ViTMatte produces proper soft alpha with natural
-        # edge transitions — final_binary_sharp MUST be disabled or
-        # it converts the soft matte back to hard 0/1 and destroys
-        # all the edge quality ViTMatte just computed.
-        params = dict(params)  # local copy — don't mutate original
-        params["final_binary_sharp"] = False
+        # MatAnyone2 produces proper soft alpha — don't binarize
+        params = dict(params)
+        params["final_binary"] = False
 
-        print(f"[H2 SamViT] ViTMatte refinement applied "
-              f"(inner={erode_radius}px, outer={dilate_radius}px)")
+        print("[H2 SamViT] MatAnyone2 refinement applied")
 
-        # Debug: save trimap to disk if requested
-        if params.get("show_trimap_overlay", False):
-            try:
-                import tempfile
-                from . import vitmatte_refiner
-                refiner = vitmatte_refiner.get_refiner()
-                trimap = refiner.create_trimap(
-                    coarse_mask,
-                    erode_radius=erode_radius,
-                    dilate_radius=dilate_radius,
-                )
-                trimap_path = os.path.join(
-                    tempfile.gettempdir(),
-                    f"h2_samvit_trimap_{node.name()}.png",
-                )
-                import cv2
-                cv2.imwrite(trimap_path, trimap)
-                print(f"[H2 SamViT] Trimap debug saved \u2192 {trimap_path}")
-            except Exception:
-                pass
+        # Debug: save coarse mask
+        if params.get("debug_save_coarse", False):
+            _debug_save(node, coarse_mask, "coarse")
     else:
-        # Pure binary mask — matches ComfyUI-SAM2/SAM3 behaviour.
-        # Alpha is strictly 0.0 or 1.0 and cannot be affected by grading.
+        # Pure binary mask — strictly 0.0 or 1.0
         alpha_matte = (coarse_mask > 0.5).astype(np.float32)
 
     alpha_matte = postprocess_mask(alpha_matte, params)
 
-    if params["enable_temporal_consistency"]:
+    if params.get("temporal_on", False):
         from . import temporal
         frame = nuke.frame()
         alpha_matte = temporal.apply_consistency(node, alpha_matte, frame, params)
 
     write_mask_to_node(node, alpha_matte, params)
-
-    # ── Render the coloured overlay (points + bbox) ──
-    # Safe here because we are called from a button callback,
-    # not from knobChanged.
-    try:
-        from . import ui_overlay
-        ui_overlay.render_overlay(node)
-    except Exception:
-        pass
 
     print(f"[H2 SamViT] {log_message}")
 
@@ -734,81 +678,112 @@ def select_detection_by_point(
     return int(np.argmin(distances))
 
 
+def _get_output_params(node) -> Dict[str, Any]:
+    """Read all output / post-processing knobs from the gizmo."""
+    def _val(name, default=0):
+        k = node.knob(name)
+        return k.value() if k else default
+
+    return {
+        "black_point": float(_val("black_point", 0.0)),
+        "white_point": float(_val("white_point", 1.0)),
+        "fill_holes": bool(_val("fill_holes", True)),
+        "fill_holes_area": int(_val("fill_holes_area", 256)),
+        "mask_shrink_grow": int(_val("mask_shrink_grow", 0)),
+        "edge_feather": int(_val("edge_feather", 0)),
+        "offset_x": int(_val("offset_x", 0)),
+        "offset_y": int(_val("offset_y", 0)),
+        "final_binary": bool(_val("final_binary", False)),
+        "output_mode": str(_val("output_mode", "Straight")),
+        "temporal_on": bool(_val("temporal_on", False)),
+        "temporal_weight": float(_val("temporal_weight", 0.5)),
+        "suppress_thresh": float(_val("suppress_thresh", 0.3)),
+        "debug_save_coarse": bool(_val("debug_save_coarse", False)),
+    }
+
+
+def _debug_save(node, mask: np.ndarray, label: str):
+    """Save a mask to temp dir for debugging."""
+    import tempfile
+    import cv2
+    import nuke
+    path = os.path.join(
+        tempfile.gettempdir(),
+        f"h2_samvit_{label}_{node.name()}_{nuke.frame()}.png",
+    )
+    cv2.imwrite(path, (np.clip(mask, 0, 1) * 255).astype(np.uint8))
+    print(f"[H2 SamViT] Debug saved -> {path}")
+
+
 def preprocess_mask(mask: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
     """Apply pre-processing to the coarse mask."""
     import cv2
-    
+
     mask = mask.copy()
-    
-    # Binary threshold
-    threshold = params["input_threshold"] / 255.0
-    mask = (mask > threshold).astype(np.float32)
-    
+
+    # Binarize at 0.5
+    mask = (mask > 0.5).astype(np.float32)
+
     # Fill holes
     if params.get("fill_holes", True):
-        hole_fill_area = int(params.get("fill_holes_area", 16))
-        if hole_fill_area > 0:
+        hole_area = int(params.get("fill_holes_area", 256))
+        if hole_area > 0:
             mask_uint8 = (mask * 255).astype(np.uint8)
-            
-            # Find contours and fill small holes
             contours, _ = cv2.findContours(
-                255 - mask_uint8, 
-                cv2.RETR_EXTERNAL, 
-                cv2.CHAIN_APPROX_SIMPLE
+                255 - mask_uint8,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
             )
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < hole_fill_area ** 2:
-                    cv2.fillPoly(mask_uint8, [contour], 255)
-            
+            for c in contours:
+                if cv2.contourArea(c) < hole_area:
+                    cv2.fillPoly(mask_uint8, [c], 255)
             mask = mask_uint8.astype(np.float32) / 255.0
-    
+
     # Black point / white point levels
     bp = float(params.get("black_point", 0.0))
     wp = float(params.get("white_point", 1.0))
     if bp > 0.0 or wp < 1.0:
-        wp = max(wp, bp + 0.001)  # prevent division by zero
+        wp = max(wp, bp + 0.001)
         mask = np.clip((mask - bp) / (wp - bp), 0.0, 1.0)
-    
+
     return mask
 
 
 def postprocess_mask(mask: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
     """Apply post-processing to the refined mask."""
     import cv2
-    
+
     mask = mask.copy()
-    
+
     # Shrink/Grow
-    shrink_grow = int(params["mask_shrink_grow"])
+    shrink_grow = int(params.get("mask_shrink_grow", 0))
     if shrink_grow != 0:
+        ksize = abs(shrink_grow) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         mask_uint8 = (mask * 255).astype(np.uint8)
-        kernel = np.ones((abs(shrink_grow), abs(shrink_grow)), np.uint8)
-        
         if shrink_grow > 0:
             mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=1)
         else:
             mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=1)
-        
         mask = mask_uint8.astype(np.float32) / 255.0
-    
+
     # Edge feather
-    feather = int(params["edge_feather"])
+    feather = int(params.get("edge_feather", 0))
     if feather > 0:
-        mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), 0)
-    
+        ksize = feather * 2 + 1
+        mask = cv2.GaussianBlur(mask, (ksize, ksize), 0)
+
     # Offset
-    offset_x = int(params["offset_mask_x"])
-    offset_y = int(params["offset_mask_y"])
-    if offset_x != 0 or offset_y != 0:
-        M = np.float32([[1, 0, offset_x], [0, 1, offset_y]])
+    ox = int(params.get("offset_x", 0))
+    oy = int(params.get("offset_y", 0))
+    if ox != 0 or oy != 0:
+        M = np.float32([[1, 0, ox], [0, 1, oy]])
         mask = cv2.warpAffine(mask, M, (mask.shape[1], mask.shape[0]))
-    
-    # Final binary sharp — ensures pure 0/1 alpha
-    if params["final_binary_sharp"]:
+
+    # Final binary
+    if params.get("final_binary", False):
         mask = (mask > 0.5).astype(np.float32)
-    
+
     return np.clip(mask, 0, 1)
 
 
@@ -898,12 +873,10 @@ def clear_models():
         _free_models()
         _text_model = None
 
-    # Unload ViTMatte via refiner
+    # Unload MatAnyone2
     try:
-        from . import vitmatte_refiner
-        refiner = vitmatte_refiner.get_refiner()
-        if refiner._loaded:
-            refiner.unload()
+        from . import matanyone2_refiner
+        matanyone2_refiner.unload()
     except Exception:
         pass
 

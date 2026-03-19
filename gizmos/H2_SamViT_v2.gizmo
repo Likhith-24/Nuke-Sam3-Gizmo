@@ -1,0 +1,721 @@
+# H2 SamViT v2.1 - Using Transform nodes for points, CornerPin for bbox
+#
+# Transform nodes have a "center" knob that displays a visible,
+# draggable crosshair in the Viewer. This is the cleanest approach.
+#
+# CornerPin2D provides 4 draggable corners for the bounding box.
+#
+# Points:
+#   - FG_01..FG_16: Transform nodes for foreground points (green crosshairs)
+#   - BG_01..BG_16: Transform nodes for background points (red crosshairs)
+#
+# Bounding Boxes:
+#   - POS_BBOX: CornerPin2D for positive (include) region
+#   - NEG_BBOX: CornerPin2D for negative (exclude) region (SAM3 only)
+
+Gizmo {
+ inputs 1
+ name H2_SamViT
+ tile_color 0x1f8f1fff
+ note_font "Verdana Bold"
+ mapsize {0.15 0.15}
+ onCreate "try:\n from H2_SamViT_Gizmo import callbacks_v2\n callbacks_v2.on_create(nuke.thisNode())\nexcept Exception as e:\n print('[H2 SamViT] onCreate error: %s' % e)"
+ knobChanged "try:\n from H2_SamViT_Gizmo import callbacks_v2\n callbacks_v2.on_knob_changed(nuke.thisNode(), nuke.thisKnob())\nexcept Exception as e:\n print('[H2 SamViT] knobChanged error: %s' % e)"
+
+ addUserKnob {20 main_tab l "H2 SamViT"}
+
+ # ─────────────────────────────────────────────────────────────
+ # Model Selection
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 model_grp l "Model" n 1}
+ addUserKnob {4 model_family l "Model Family" M {"SAM2" "SAM3" "SEC-4B"}}
+ model_family "SAM3"
+ addUserKnob {4 sam_version l "SAM Version" M {"2.0" "2.1" "3.0"}}
+ sam_version "3.0"
+ addUserKnob {4 model_size l "Model Size" M {"Tiny" "Small" "Base+" "Large"}}
+ model_size "Large"
+ addUserKnob {4 model_precision l "Precision" M {"fp16" "bf16" "fp32"}}
+ model_precision "bf16"
+ addUserKnob {22 download_model l "Download Model" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.download_model_action(nuke.thisNode())" +STARTLINE}
+ addUserKnob {26 model_status l "Status" T "Not downloaded"}
+ addUserKnob {20 endGroup_model l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Pipeline Mode
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {4 pipeline_mode l "Pipeline Mode" M {"Point / Bbox" "Text Prompt"}}
+ pipeline_mode "Point / Bbox"
+ addUserKnob {1 text_prompt l "Text Prompt" +HIDDEN}
+ text_prompt ""
+
+ # ─────────────────────────────────────────────────────────────
+ # Run Inference
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {26 div_run l "" +STARTLINE}
+ addUserKnob {22 run_inference l "Run Inference" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.run_inference(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 process_sequence l "Process Sequence" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.process_sequence(nuke.thisNode())" +STARTLINE}
+
+ # ─────────────────────────────────────────────────────────────
+ # Interactive Tools
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 tools_grp l "Tools" n 1}
+ addUserKnob {6 enable_edit l "Enable Edit" +STARTLINE}
+ enable_edit true
+ addUserKnob {26 tools_info l "" +STARTLINE T "<small><b>How to use:</b>\n1. Click 'Add FG Point' or 'Add BG Point' to enable a point\n2. Select the internal Transform node and drag its center in the Viewer\n3. Enable 'Pos Bbox' and drag the CornerPin corners\n4. Run Inference when ready</small>"}
+ 
+ # Control buttons
+ addUserKnob {22 add_fg_point l "Add FG Point" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.add_fg_point(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 add_bg_point l "Add BG Point" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.add_bg_point(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 clear_all_points l "Clear All Points" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.clear_all_points(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 reset_bbox l "Reset Bbox" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.reset_bbox(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 reset_neg_bbox l "Reset Neg Bbox" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.reset_neg_bbox(nuke.thisNode())" +STARTLINE}
+ addUserKnob {20 endGroup_tools l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Point Controls
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 points_grp l "Points List" n 1}
+ points_grp 0
+ addUserKnob {26 points_info l "" +STARTLINE T "<small>Enable points here. Drag their center handle in the Viewer.\nDouble-click inside the gizmo > select FG_xx or BG_xx > drag center.</small>"}
+ 
+ # FG Points
+ addUserKnob {26 div_fg l "<b>Foreground Points (Include)</b>"}
+ addUserKnob {6 fg_01_enabled l "FG 1" +STARTLINE}
+ fg_01_enabled false
+ addUserKnob {6 fg_02_enabled l "FG 2" -STARTLINE}
+ fg_02_enabled false
+ addUserKnob {6 fg_03_enabled l "FG 3" -STARTLINE}
+ fg_03_enabled false
+ addUserKnob {6 fg_04_enabled l "FG 4" -STARTLINE}
+ fg_04_enabled false
+ addUserKnob {6 fg_05_enabled l "FG 5" +STARTLINE}
+ fg_05_enabled false
+ addUserKnob {6 fg_06_enabled l "FG 6" -STARTLINE}
+ fg_06_enabled false
+ addUserKnob {6 fg_07_enabled l "FG 7" -STARTLINE}
+ fg_07_enabled false
+ addUserKnob {6 fg_08_enabled l "FG 8" -STARTLINE}
+ fg_08_enabled false
+ addUserKnob {6 fg_09_enabled l "FG 9" +STARTLINE}
+ fg_09_enabled false
+ addUserKnob {6 fg_10_enabled l "FG 10" -STARTLINE}
+ fg_10_enabled false
+ addUserKnob {6 fg_11_enabled l "FG 11" -STARTLINE}
+ fg_11_enabled false
+ addUserKnob {6 fg_12_enabled l "FG 12" -STARTLINE}
+ fg_12_enabled false
+ addUserKnob {6 fg_13_enabled l "FG 13" +STARTLINE}
+ fg_13_enabled false
+ addUserKnob {6 fg_14_enabled l "FG 14" -STARTLINE}
+ fg_14_enabled false
+ addUserKnob {6 fg_15_enabled l "FG 15" -STARTLINE}
+ fg_15_enabled false
+ addUserKnob {6 fg_16_enabled l "FG 16" -STARTLINE}
+ fg_16_enabled false
+ 
+ # BG Points
+ addUserKnob {26 div_bg l "<b>Background Points (Exclude)</b>"}
+ addUserKnob {6 bg_01_enabled l "BG 1" +STARTLINE}
+ bg_01_enabled false
+ addUserKnob {6 bg_02_enabled l "BG 2" -STARTLINE}
+ bg_02_enabled false
+ addUserKnob {6 bg_03_enabled l "BG 3" -STARTLINE}
+ bg_03_enabled false
+ addUserKnob {6 bg_04_enabled l "BG 4" -STARTLINE}
+ bg_04_enabled false
+ addUserKnob {6 bg_05_enabled l "BG 5" +STARTLINE}
+ bg_05_enabled false
+ addUserKnob {6 bg_06_enabled l "BG 6" -STARTLINE}
+ bg_06_enabled false
+ addUserKnob {6 bg_07_enabled l "BG 7" -STARTLINE}
+ bg_07_enabled false
+ addUserKnob {6 bg_08_enabled l "BG 8" -STARTLINE}
+ bg_08_enabled false
+ addUserKnob {6 bg_09_enabled l "BG 9" +STARTLINE}
+ bg_09_enabled false
+ addUserKnob {6 bg_10_enabled l "BG 10" -STARTLINE}
+ bg_10_enabled false
+ addUserKnob {6 bg_11_enabled l "BG 11" -STARTLINE}
+ bg_11_enabled false
+ addUserKnob {6 bg_12_enabled l "BG 12" -STARTLINE}
+ bg_12_enabled false
+ addUserKnob {6 bg_13_enabled l "BG 13" +STARTLINE}
+ bg_13_enabled false
+ addUserKnob {6 bg_14_enabled l "BG 14" -STARTLINE}
+ bg_14_enabled false
+ addUserKnob {6 bg_15_enabled l "BG 15" -STARTLINE}
+ bg_15_enabled false
+ addUserKnob {6 bg_16_enabled l "BG 16" -STARTLINE}
+ bg_16_enabled false
+ addUserKnob {20 endGroup_points l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Bounding Box Controls
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 bbox_grp l "Bounding Box" n 1}
+ bbox_grp 0
+ addUserKnob {26 bbox_info l "" +STARTLINE T "<small>Enable bbox and drag the CornerPin corners in the Viewer.\nDouble-click gizmo > select POS_BBOX > drag corners to1/to2/to3/to4.</small>"}
+ addUserKnob {6 bbox_enabled l "Pos Bbox Enabled" +STARTLINE}
+ bbox_enabled false
+ addUserKnob {6 neg_bbox_enabled l "Neg Bbox Enabled (SAM3)" +STARTLINE}
+ neg_bbox_enabled false
+ addUserKnob {20 endGroup_bbox l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # UI Appearance
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 ui_appearance_grp l "UI Appearance" n 1}
+ ui_appearance_grp 0
+ addUserKnob {6 show_ui_overlays l "Show / Hide Guides" +STARTLINE}
+ show_ui_overlays true
+ addUserKnob {6 show_point_labels l "Show Point Labels" +STARTLINE}
+ show_point_labels true
+ addUserKnob {18 fg_point_color l "FG Point Color"}
+ fg_point_color {0 1 0}
+ addUserKnob {6 fg_point_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {18 bg_point_color l "BG Point Color"}
+ bg_point_color {1 0 0}
+ addUserKnob {6 bg_point_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {18 bbox_color l "Pos Bbox Color"}
+ bbox_color {0 0.65 1}
+ addUserKnob {6 bbox_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {18 neg_bbox_color l "Neg Bbox Color"}
+ neg_bbox_color {1 0.3 0}
+ addUserKnob {6 neg_bbox_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {7 overlay_scale l "Overlay Scale" R 0.5 2}
+ overlay_scale 1.0
+ addUserKnob {20 endGroup_ui l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Pre Processing
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 pre_processing_grp l "Pre Processing" n 1}
+ pre_processing_grp 0
+ addUserKnob {7 input_threshold l "Binary Threshold" R 0 255}
+ input_threshold 100
+ addUserKnob {6 fill_holes l "Fill Holes" +STARTLINE}
+ fill_holes true
+ addUserKnob {7 fill_holes_area l "Fill Holes Area" R 0 32}
+ fill_holes_area 16
+ addUserKnob {7 crop_padding l "Crop Padding %" R 0 50}
+ crop_padding 20
+ addUserKnob {20 endGroup_preproc l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # VitMatte Trimap
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 vitmatte_trimap_grp l "VitMatte Trimap" n 1}
+ vitmatte_trimap_grp 0
+ addUserKnob {6 use_vitmatte l "Enable ViTMatte Refinement" +STARTLINE}
+ use_vitmatte false
+ addUserKnob {26 vitmatte_info l "" +STARTLINE T "<small>ViTMatte refines SAM's coarse mask into soft alpha.\n<b>Inner Edge</b> = erode into mask. <b>Outer Edge</b> = dilate outward.</small>"}
+ addUserKnob {7 trimap_erode_radius l "Inner Edge (px)" R 0 50}
+ trimap_erode_radius 5
+ addUserKnob {7 trimap_dilate_radius l "Outer Edge (px)" R 0 50}
+ trimap_dilate_radius 15
+ addUserKnob {6 show_trimap_overlay l "Save Trimap Debug" +STARTLINE}
+ show_trimap_overlay false
+ addUserKnob {20 endGroup_vitmatte l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Output
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 output_grp l "Output" n 1}
+ addUserKnob {4 output_alpha_mode l "Output Alpha Mode" M {"Straight" "Premultiplied"}}
+ output_alpha_mode "Straight"
+ addUserKnob {4 display_mode l "Display Mode" M {"Matte" "Overlay"}}
+ display_mode "Overlay"
+ addUserKnob {6 show_mask_overlay l "Show Mask Overlay" +STARTLINE}
+ show_mask_overlay true
+ addUserKnob {19 overlay_color l "Overlay Color"}
+ overlay_color {0.5 0 0 0.5}
+ addUserKnob {6 overlay_color_panelDropped l "panel dropped state" -STARTLINE +HIDDEN}
+ addUserKnob {7 mask_shrink_grow l "Mask Shrink/Grow" R -50 50}
+ mask_shrink_grow 0
+ addUserKnob {7 edge_feather l "Edge Feather" R 0 100}
+ edge_feather 0
+ addUserKnob {7 offset_mask_x l "Offset Mask X" R -100 100}
+ offset_mask_x 0
+ addUserKnob {7 offset_mask_y l "Offset Mask Y" R -100 100}
+ offset_mask_y 0
+ addUserKnob {6 final_binary_sharp l "Final Binary Sharp" +STARTLINE}
+ final_binary_sharp true
+ addUserKnob {20 endGroup_output l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Temporal Mask Consistency
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 temporal_consistency_grp l "Temporal Mask Consistency" n 1}
+ temporal_consistency_grp 0
+ addUserKnob {6 enable_temporal_consistency l "Enable Temporal Consistency" +STARTLINE}
+ enable_temporal_consistency true
+ addUserKnob {7 temporal_weight l "Temporal Weight %" R 0 100}
+ temporal_weight 50
+ addUserKnob {7 suppression_threshold l "Suppression Threshold %" R 0 100}
+ suppression_threshold 30
+ addUserKnob {20 endGroup_temporal_consistency l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Temporal Smoothing Motion
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 temporal_smoothing_grp l "Temporal Smoothing Motion" n 1}
+ temporal_smoothing_grp 0
+ addUserKnob {6 enable_temporal l "Enable Temporal" +STARTLINE}
+ enable_temporal false
+ addUserKnob {7 temporal_smoothing l "Smoothing" R 0 100}
+ temporal_smoothing 50
+ addUserKnob {6 smooth_edges_only l "Smooth edges only" +STARTLINE}
+ smooth_edges_only false
+ addUserKnob {7 edge_width l "Edge width" R 3 30}
+ edge_width 8
+ addUserKnob {20 endGroup_temporal_smoothing l endGroup n -1}
+
+ # ─────────────────────────────────────────────────────────────
+ # Cache Memory
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 cache_memory_grp l "Cache Memory" n 1}
+ cache_memory_grp 0
+ addUserKnob {7 cache_memory_percent l "Cache Memory %" R 10 75}
+ cache_memory_percent 25
+ addUserKnob {26 cache_limit l "Cache Limit" T "Calculating..."}
+ addUserKnob {20 endGroup_cache l endGroup n -1}
+
+ addUserKnob {22 reset_all_parameters l "Reset All Parameters" T "from H2_SamViT_Gizmo import callbacks_v2; callbacks_v2.reset_all_parameters(nuke.thisNode())" +STARTLINE}
+
+ # ─────────────────────────────────────────────────────────────
+ # License
+ # ─────────────────────────────────────────────────────────────
+ addUserKnob {20 license_grp l "License" n 1}
+ license_grp 0
+ addUserKnob {26 license_text l "" +STARTLINE T "H2 SamViT v2.1\nSAM3 + ViTMatte\nNative Transform/CornerPin handles\n(c) 2026 H2 Studios"}
+ addUserKnob {20 endGroup_license l endGroup n -1}
+
+}
+ # ═══════════════════════════════════════════════════════════
+ # Internal Node Graph
+ # ═══════════════════════════════════════════════════════════
+ 
+ Input {
+  inputs 0
+  name Input1
+  xpos 0
+  ypos -800
+ }
+ 
+ Dot {
+  name InputDot
+  xpos 34
+  ypos -700
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # FOREGROUND POINTS (Transform nodes with center handle)
+ # Each Transform has a visible crosshair at its "center" knob.
+ # ═══════════════════════════════════════════════════════════
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_01
+  label "FG Point 1"
+  xpos -800
+  ypos -400
+  disable {{!parent.fg_01_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_02
+  label "FG Point 2"
+  xpos -700
+  ypos -400
+  disable {{!parent.fg_02_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_03
+  label "FG Point 3"
+  xpos -600
+  ypos -400
+  disable {{!parent.fg_03_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_04
+  label "FG Point 4"
+  xpos -500
+  ypos -400
+  disable {{!parent.fg_04_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_05
+  label "FG Point 5"
+  xpos -800
+  ypos -350
+  disable {{!parent.fg_05_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_06
+  label "FG Point 6"
+  xpos -700
+  ypos -350
+  disable {{!parent.fg_06_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_07
+  label "FG Point 7"
+  xpos -600
+  ypos -350
+  disable {{!parent.fg_07_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_08
+  label "FG Point 8"
+  xpos -500
+  ypos -350
+  disable {{!parent.fg_08_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_09
+  label "FG Point 9"
+  xpos -800
+  ypos -300
+  disable {{!parent.fg_09_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_10
+  label "FG Point 10"
+  xpos -700
+  ypos -300
+  disable {{!parent.fg_10_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_11
+  label "FG Point 11"
+  xpos -600
+  ypos -300
+  disable {{!parent.fg_11_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_12
+  label "FG Point 12"
+  xpos -500
+  ypos -300
+  disable {{!parent.fg_12_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_13
+  label "FG Point 13"
+  xpos -800
+  ypos -250
+  disable {{!parent.fg_13_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_14
+  label "FG Point 14"
+  xpos -700
+  ypos -250
+  disable {{!parent.fg_14_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_15
+  label "FG Point 15"
+  xpos -600
+  ypos -250
+  disable {{!parent.fg_15_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name FG_16
+  label "FG Point 16"
+  xpos -500
+  ypos -250
+  disable {{!parent.fg_16_enabled}}
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # BACKGROUND POINTS (Transform nodes with center handle)
+ # ═══════════════════════════════════════════════════════════
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_01
+  label "BG Point 1"
+  xpos -300
+  ypos -400
+  disable {{!parent.bg_01_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_02
+  label "BG Point 2"
+  xpos -200
+  ypos -400
+  disable {{!parent.bg_02_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_03
+  label "BG Point 3"
+  xpos -100
+  ypos -400
+  disable {{!parent.bg_03_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_04
+  label "BG Point 4"
+  xpos 0
+  ypos -400
+  disable {{!parent.bg_04_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_05
+  label "BG Point 5"
+  xpos -300
+  ypos -350
+  disable {{!parent.bg_05_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_06
+  label "BG Point 6"
+  xpos -200
+  ypos -350
+  disable {{!parent.bg_06_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_07
+  label "BG Point 7"
+  xpos -100
+  ypos -350
+  disable {{!parent.bg_07_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_08
+  label "BG Point 8"
+  xpos 0
+  ypos -350
+  disable {{!parent.bg_08_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_09
+  label "BG Point 9"
+  xpos -300
+  ypos -300
+  disable {{!parent.bg_09_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_10
+  label "BG Point 10"
+  xpos -200
+  ypos -300
+  disable {{!parent.bg_10_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_11
+  label "BG Point 11"
+  xpos -100
+  ypos -300
+  disable {{!parent.bg_11_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_12
+  label "BG Point 12"
+  xpos 0
+  ypos -300
+  disable {{!parent.bg_12_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_13
+  label "BG Point 13"
+  xpos -300
+  ypos -250
+  disable {{!parent.bg_13_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_14
+  label "BG Point 14"
+  xpos -200
+  ypos -250
+  disable {{!parent.bg_14_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_15
+  label "BG Point 15"
+  xpos -100
+  ypos -250
+  disable {{!parent.bg_15_enabled}}
+ }
+ 
+ Transform {
+  inputs 0
+  center {960 540}
+  name BG_16
+  label "BG Point 16"
+  xpos 0
+  ypos -250
+  disable {{!parent.bg_16_enabled}}
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # POSITIVE BOUNDING BOX (CornerPin2D)
+ # Drag corners to define the include region
+ # ═══════════════════════════════════════════════════════════
+ 
+ CornerPin2D {
+  inputs 0
+  to1 {480 270}
+  to2 {1440 270}
+  to3 {1440 810}
+  to4 {480 810}
+  invert false
+  from1 {480 270}
+  from2 {1440 270}
+  from3 {1440 810}
+  from4 {480 810}
+  name POS_BBOX
+  label "Positive Bbox\n(Include Region)"
+  xpos 200
+  ypos -400
+  disable {{!parent.bbox_enabled}}
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # NEGATIVE BOUNDING BOX (CornerPin2D, SAM3 only)
+ # Drag corners to define the exclude region
+ # ═══════════════════════════════════════════════════════════
+ 
+ CornerPin2D {
+  inputs 0
+  to1 {100 100}
+  to2 {200 100}
+  to3 {200 200}
+  to4 {100 200}
+  invert false
+  from1 {100 100}
+  from2 {200 100}
+  from3 {200 200}
+  from4 {100 200}
+  name NEG_BBOX
+  label "Negative Bbox\n(Exclude Region - SAM3)"
+  xpos 350
+  ypos -400
+  disable {{!parent.neg_bbox_enabled}}
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # Mask placeholder (updated by inference)
+ # ═══════════════════════════════════════════════════════════
+ 
+ Constant {
+  inputs 0
+  channels rgba
+  color {0 0 0 0}
+  format "1920 1080 0 0 1920 1080 1 HD_1080"
+  name MaskSource
+  xpos 200
+  ypos -200
+ }
+ 
+ # ═══════════════════════════════════════════════════════════
+ # Merge mask onto input
+ # ═══════════════════════════════════════════════════════════
+ 
+ push 0
+ Copy {
+  inputs 2
+  from0 rgba.red
+  to0 rgba.alpha
+  name CopyAlpha
+  xpos 0
+  ypos -200
+  disable true
+ }
+ 
+ Output {
+  name Output1
+  xpos 0
+  ypos 0
+ }
+
+end_group

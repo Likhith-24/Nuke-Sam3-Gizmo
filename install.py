@@ -221,6 +221,7 @@ def step_install_packages(pip_bin: str) -> None:
         "Pillow>=9.5.0",
         "psutil>=5.9.0",
         "hydra-core>=1.3.0",
+        "omegaconf>=2.3.0",
         "iopath>=0.1.10",
     ]
     _run([pip_bin, "install", "--no-cache-dir", "--upgrade", "pip", "wheel", "setuptools"])
@@ -310,6 +311,7 @@ def step_install_to_target(python_bin: str, target_dir: Path,
         "Pillow>=9.5.0",
         "psutil>=5.9.0",
         "hydra-core>=1.3.0",
+        "omegaconf>=2.3.0",
         "iopath>=0.1.10",
     ]
     _run(pip_target + packages)
@@ -455,9 +457,9 @@ def print_model_info() -> None:
     sam_path = models_dir / "sam3.pt"
     if sam_path.exists():
         mb = sam_path.stat().st_size / (1024 ** 2)
-        print(f"  [SAM3]    ✓ Found ({mb:.0f} MB)")
+        print(f"  [SAM3]    \u2713 Found ({mb:.0f} MB)")
     else:
-        print(f"  [SAM3]    ✗ Download from:")
+        print(f"  [SAM3]    \u2717 Download from:")
         print(f"            https://huggingface.co/facebook/sam3")
         print(f"            Save as: {sam_path}")
 
@@ -466,10 +468,18 @@ def print_model_info() -> None:
         p = models_dir / name
         if p.exists():
             mb = p.stat().st_size / (1024 ** 2)
-            print(f"  [SAM2]    ✓ {name} ({mb:.0f} MB)")
+            print(f"  [SAM2]    \u2713 {name} ({mb:.0f} MB)")
 
-    print(f"  [ViTMatte]  Auto-downloaded from HuggingFace on first use")
-    print(f"              (hustvl/vitmatte-small-composition-1k)\n")
+    ma2_path = models_dir / "matanyone2.pth"
+    if ma2_path.exists():
+        mb = ma2_path.stat().st_size / (1024 ** 2)
+        print(f"  [MA2]     \u2713 Found ({mb:.0f} MB)")
+    else:
+        print(f"  [MA2]     \u2717 Download from:")
+        print(f"            https://github.com/pq-yang/MatAnyone2/releases")
+        print(f"            Save as: {ma2_path}")
+
+    print()
 
 
 def save_config(env_dir: Path) -> None:
@@ -492,9 +502,9 @@ def save_config(env_dir: Path) -> None:
 def verify_plugin_files() -> bool:
     """Check that all required plugin files are present."""
     required = [
-        "__init__.py", "callbacks.py", "inference.py", "temporal.py",
-        "cache.py", "filters.py", "vitmatte_refiner.py",
-        "env_bootstrap.py", "gizmos/H2_SamViT.gizmo",
+        "__init__.py", "callbacks_v3.py", "inference.py", "temporal.py",
+        "cache.py", "filters.py", "matanyone2_refiner.py",
+        "env_bootstrap.py", "gizmos/H2_SamViT_v3.gizmo",
     ]
     ok = True
     for f in required:

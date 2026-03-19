@@ -1,10 +1,12 @@
-# H2_SamViT_Gizmo - SAM3 + ViTMatte Gizmo for Nuke
+# H2_SamViT_Gizmo — SAM3/SAM2 + MatAnyone2 Gizmo for Nuke
 # Copyright (C) 2026
 #
-# A comprehensive AI-powered segmentation and matting gizmo combining
-# SAM3 (Segment Anything Model 3) with ViTMatte for high-quality alpha mattes.
+# AI-powered segmentation (SAM3/SAM2) and alpha matting (MatAnyone2)
+# for production-quality alpha mattes inside Nuke.
+#
+# v3: MatAnyone2 replaces ViTMatte. Simple XY knobs for points/bbox.
 
-__version__ = "1.1.0"
+__version__ = "3.0.0"
 __author__ = "H2"
 
 import os
@@ -45,25 +47,10 @@ def register():
     if os.path.exists(ICONS_DIR):
         nuke.pluginAddPath(ICONS_DIR)
 
-    # Register knob-changed handlers
-    from . import callbacks  # noqa: F811
+    # Register knob-changed handlers (v3)
+    from . import callbacks_v3  # noqa: F811
 
-    # Install viewer click handler (plain left-click to place points/bbox)
-    try:
-        from . import viewer_events
-        viewer_events.install()
-    except Exception as _e:
-        print(f"[H2_SamViT_Gizmo] Viewer click handler not installed: {_e}")
-
-    # Install Qt viewer overlay (ONYX-style crosshairs / bbox)
-    try:
-        from . import viewer_overlay
-        if not viewer_overlay.install():
-            print("[H2_SamViT_Gizmo] Qt overlay deferred (viewer not ready)")
-    except Exception as _e:
-        print(f"[H2_SamViT_Gizmo] Qt overlay not installed: {_e}")
-
-    print(f"[H2_SamViT_Gizmo] Registered v{__version__}")
+    print(f"[H2_SamViT_Gizmo] Registered v{__version__} (SAM3/SAM2 + MatAnyone2)")
 
 
 def unregister():

@@ -1,0 +1,242 @@
+# H2 SamViT v3.0 — SAM3/SAM2 + MatAnyone2 Alpha Matting
+#
+# Pipeline:
+#   Input → SAM3/SAM2 (segmentation) → Coarse Mask
+#   Coarse Mask + Input → MatAnyone2 (alpha matting) → Alpha Matte
+#
+# Points & Bbox use XY knobs on the gizmo panel.
+# User reads cursor position from Nuke's status bar, types into knobs.
+# "Pick" buttons open a convenience dialog.
+#
+# Internal node graph:
+#   Input1 → CopyAlpha(input0=Input1, input1=MaskRead) → Output1
+
+Gizmo {
+ inputs 1
+ name H2_SamViT
+ tile_color 0x1f8f1fff
+ note_font "Verdana Bold"
+ mapsize {0.15 0.15}
+ onCreate "try:\n from H2_SamViT_Gizmo import callbacks_v3\n callbacks_v3.on_create(nuke.thisNode())\nexcept Exception as e:\n print('[H2 SamViT] onCreate error: %s' % e)"
+ knobChanged "try:\n from H2_SamViT_Gizmo import callbacks_v3\n callbacks_v3.on_knob_changed(nuke.thisNode(), nuke.thisKnob())\nexcept Exception as e:\n print('[H2 SamViT] knobChanged error: %s' % e)"
+
+ addUserKnob {20 main_tab l "H2 SamViT"}
+
+ # ════════════════════════════════════════════════════════════
+ #  Model Selection
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 model_grp l "Model Selection" n 1}
+ addUserKnob {4 model_family l "Family" M {"SAM2" "SAM3"}}
+ model_family "SAM3"
+ addUserKnob {4 sam_version l "Version" M {"2.0" "2.1"}}
+ sam_version "2.1"
+ addUserKnob {4 model_size l "Size" M {"Tiny" "Small" "Base+" "Large"}}
+ model_size "Large"
+ addUserKnob {4 model_precision l "Precision" M {"fp16" "bf16" "fp32"}}
+ model_precision "bf16"
+ addUserKnob {22 download_model l "Download Model" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.download_model(nuke.thisNode())" +STARTLINE}
+ addUserKnob {26 model_status l "Status" T "Not loaded"}
+ addUserKnob {20 endGroup_model l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  Pipeline Mode
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {4 pipeline_mode l "Pipeline" M {"Point / Bbox" "Text Prompt"}}
+ pipeline_mode "Point / Bbox"
+ addUserKnob {1 text_prompt l "Text Prompt" +HIDDEN}
+ text_prompt ""
+
+ # ════════════════════════════════════════════════════════════
+ #  Run Controls
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {26 _div_run l "" +STARTLINE}
+ addUserKnob {22 btn_run l "<b>Run Inference</b>" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.run_inference(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 btn_sequence l "Process Sequence" -STARTLINE T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.process_sequence(nuke.thisNode())"}
+ addUserKnob {22 btn_clear_mask l "Clear Mask" -STARTLINE T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.clear_mask(nuke.thisNode())"}
+ addUserKnob {26 inference_status l "" +STARTLINE T " "}
+
+ # ════════════════════════════════════════════════════════════
+ #  Foreground Points  (include)
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 fg_grp l "FG Points" n 1}
+ fg_grp 0
+ addUserKnob {26 _fg_help l "" +STARTLINE T "<small>Hover image in Viewer \u2192 read (x, y) from status bar \u2192 type here. Nuke origin = bottom-left.</small>"}
+
+ addUserKnob {6 fg_1_on l "" +STARTLINE}
+ addUserKnob {12 fg_1 l "FG 1" -STARTLINE}
+ fg_1 {960 540}
+ addUserKnob {6 fg_2_on l "" +STARTLINE}
+ addUserKnob {12 fg_2 l "FG 2" -STARTLINE}
+ fg_2 {960 540}
+ addUserKnob {6 fg_3_on l "" +STARTLINE}
+ addUserKnob {12 fg_3 l "FG 3" -STARTLINE}
+ fg_3 {960 540}
+ addUserKnob {6 fg_4_on l "" +STARTLINE}
+ addUserKnob {12 fg_4 l "FG 4" -STARTLINE}
+ fg_4 {960 540}
+
+ addUserKnob {22 btn_add_fg l "Add Next FG" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.add_fg_point(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 btn_clear_fg l "Clear FG" -STARTLINE T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.clear_fg_points(nuke.thisNode())"}
+ addUserKnob {20 endGroup_fg l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  Background Points  (exclude)
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 bg_grp l "BG Points" n 1}
+ bg_grp 0
+
+ addUserKnob {6 bg_1_on l "" +STARTLINE}
+ addUserKnob {12 bg_1 l "BG 1" -STARTLINE}
+ bg_1 {960 540}
+ addUserKnob {6 bg_2_on l "" +STARTLINE}
+ addUserKnob {12 bg_2 l "BG 2" -STARTLINE}
+ bg_2 {960 540}
+ addUserKnob {6 bg_3_on l "" +STARTLINE}
+ addUserKnob {12 bg_3 l "BG 3" -STARTLINE}
+ bg_3 {960 540}
+ addUserKnob {6 bg_4_on l "" +STARTLINE}
+ addUserKnob {12 bg_4 l "BG 4" -STARTLINE}
+ bg_4 {960 540}
+
+ addUserKnob {22 btn_add_bg l "Add Next BG" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.add_bg_point(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 btn_clear_bg l "Clear BG" -STARTLINE T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.clear_bg_points(nuke.thisNode())"}
+ addUserKnob {20 endGroup_bg l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  Bounding Box
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 bbox_grp l "Bounding Box" n 1}
+ bbox_grp 0
+ addUserKnob {26 _bbox_help l "" +STARTLINE T "<small>SAM box prompt: define region of interest. XYXY = bottom-left to top-right.</small>"}
+ addUserKnob {6 bbox_on l "Enable Bbox" +STARTLINE}
+ bbox_on false
+ addUserKnob {12 bbox_tl l "Bottom-Left"}
+ bbox_tl {400 200}
+ addUserKnob {12 bbox_br l "Top-Right"}
+ bbox_br {1520 880}
+
+ addUserKnob {6 neg_bbox_on l "Enable Neg Bbox (SAM3)" +STARTLINE}
+ neg_bbox_on false
+ addUserKnob {12 neg_bbox_tl l "Neg BL"}
+ neg_bbox_tl {100 100}
+ addUserKnob {12 neg_bbox_br l "Neg TR"}
+ neg_bbox_br {300 300}
+
+ addUserKnob {22 btn_reset_bbox l "Reset Bbox" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.reset_bbox(nuke.thisNode())" +STARTLINE}
+ addUserKnob {20 endGroup_bbox l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  MatAnyone2 (Alpha Matting)
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 matanyone_grp l "MatAnyone2" n 1}
+ addUserKnob {6 use_matanyone2 l "Enable MatAnyone2 Refinement" +STARTLINE}
+ use_matanyone2 true
+ addUserKnob {26 _ma2_info l "" +STARTLINE T "<small>Refines SAM's coarse binary mask into production-quality soft alpha.\nDisable for fast binary-only masking.</small>"}
+ addUserKnob {22 btn_download_ma2 l "Download MatAnyone2" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.download_matanyone2(nuke.thisNode())" +STARTLINE}
+ addUserKnob {26 ma2_status l "Status" T "Not loaded"}
+ addUserKnob {3 ma2_mem_every l "Memory Every N Frames" t "How often to update MatAnyone2's long-term memory during sequence processing. Lower = more accurate but slower."}
+ ma2_mem_every 5
+ addUserKnob {3 ma2_max_mem l "Max Memory Frames" t "Maximum number of frames stored in MatAnyone2's long-term memory."}
+ ma2_max_mem 5
+ addUserKnob {20 endGroup_matanyone l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  Output Adjustments
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 output_grp l "Output" n 1}
+ addUserKnob {7 black_point l "Black Point" R 0 0.5}
+ black_point 0
+ addUserKnob {7 white_point l "White Point" R 0.5 1}
+ white_point 1
+ addUserKnob {6 fill_holes l "Fill Holes" +STARTLINE}
+ fill_holes true
+ addUserKnob {3 fill_holes_area l "Hole Area (px\u00b2)"}
+ fill_holes_area 256
+ addUserKnob {7 mask_shrink_grow l "Shrink / Grow" R -50 50}
+ mask_shrink_grow 0
+ addUserKnob {7 edge_feather l "Edge Feather" R 0 50}
+ edge_feather 0
+ addUserKnob {7 offset_x l "Offset X" R -100 100}
+ offset_x 0
+ addUserKnob {7 offset_y l "Offset Y" R -100 100}
+ offset_y 0
+ addUserKnob {6 final_binary l "Force Binary (hard edges)" +STARTLINE}
+ final_binary false
+ addUserKnob {4 output_mode l "Output Alpha" M {"Straight" "Premultiplied"}}
+ output_mode "Straight"
+ addUserKnob {20 endGroup_output l endGroup n -1}
+
+ # ════════════════════════════════════════════════════════════
+ #  Advanced
+ # ════════════════════════════════════════════════════════════
+ addUserKnob {20 advanced_tab l "Advanced"}
+
+ addUserKnob {20 cache_grp l "Cache" n 1}
+ addUserKnob {7 cache_pct l "Cache Memory %" R 10 75}
+ cache_pct 25
+ addUserKnob {26 cache_info l "Cache" T "0 frames"}
+ addUserKnob {22 btn_clear_cache l "Clear Cache" T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.clear_cache(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 btn_unload_models l "Unload Models" -STARTLINE T "from H2_SamViT_Gizmo import callbacks_v3; callbacks_v3.unload_models(nuke.thisNode())"}
+ addUserKnob {20 endGroup_cache l endGroup n -1}
+
+ addUserKnob {20 temporal_grp l "Temporal Consistency" n 1}
+ temporal_grp 0
+ addUserKnob {6 temporal_on l "Enable" +STARTLINE}
+ temporal_on false
+ addUserKnob {7 temporal_weight l "Weight" R 0 1}
+ temporal_weight 0.5
+ addUserKnob {7 suppress_thresh l "Jump Suppress" R 0 1}
+ suppress_thresh 0.3
+ addUserKnob {20 endGroup_temporal l endGroup n -1}
+
+ addUserKnob {20 debug_grp l "Debug" n 1}
+ debug_grp 0
+ addUserKnob {6 debug_log l "Verbose Log" +STARTLINE}
+ debug_log false
+ addUserKnob {6 debug_save_coarse l "Save Coarse Mask" +STARTLINE}
+ debug_save_coarse false
+ addUserKnob {20 endGroup_debug l endGroup n -1}
+
+ addUserKnob {26 _about l "" +STARTLINE T "<small>H2 SamViT v3.0 \u2014 SAM3/SAM2 + MatAnyone2\n\u00a9 2026 H2</small>"}
+}
+
+ # ═══════════════════════════════════════════════════════════
+ #  Internal Node Graph
+ # ═══════════════════════════════════════════════════════════
+
+ Input {
+  inputs 0
+  name Input1
+  xpos 0
+  ypos -200
+ }
+
+ Constant {
+  inputs 0
+  channels alpha
+  color 0
+  name MaskSource
+  xpos 200
+  ypos -200
+ }
+
+ Copy {
+  inputs 2
+  from0 rgba.alpha
+  to0 rgba.alpha
+  name CopyAlpha
+  xpos 0
+  ypos -100
+  disable true
+ }
+ set C0 [stack 0]
+
+ Output {
+  name Output1
+  xpos 0
+  ypos 0
+ }
+
+ push $C0
+
+end_group

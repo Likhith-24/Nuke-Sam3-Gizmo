@@ -1,4 +1,4 @@
-# H2 SamViT Gizmo — SAM 2 / SAM 3 + ViTMatte for Nuke
+# H2 SamViT Gizmo — SAM 2 / SAM 3 + MatAnyone2 for Nuke
 # Requirements file for pip installation
 #
 # NOTE: install.py handles the full setup automatically.
@@ -28,8 +28,10 @@ pycocotools>=2.0.0
 timm>=1.0.0
 ftfy>=6.1.0
 
-# ── ViTMatte (alpha refinement) ───────────────────────────
-transformers>=4.30.0
+# ── MatAnyone2 (alpha matting refinement) ─────────────────
+# Uses third_party/MatAnyone2 — no pip install needed.
+# Config via OmegaConf:
+omegaconf>=2.3.0
 
 # ── Text prompt mode (Grounding DINO) ────────────────────
 # Auto-downloaded from HuggingFace on first use; cached locally
