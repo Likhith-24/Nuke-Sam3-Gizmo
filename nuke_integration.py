@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 
 from . import _interrupt_check as _IC
+from . import _progress as _PB
 def get_input_image(node: nuke.Node, channel: str = "rgba") -> Optional[np.ndarray]:
     """
     Extract image data from a node's input.
@@ -45,9 +46,9 @@ def get_input_image(node: nuke.Node, channel: str = "rgba") -> Optional[np.ndarr
     # This is a simplified placeholder
     try:
         for c, ch_name in enumerate(channel_names):
-            for y in range(height):
+            for y in _PB.track(range(height), height, "NukeGizmo"):
                 _IC.check()
-                for x in range(width):
+                for x in _PB.track(range(width), width, "NukeGizmo"):
                     # This is slow - production code would use Tile API
                     image[y, x, c] = input_node.sample(f"rgba.{ch_name}", x, y)
     except Exception as e:
