@@ -481,6 +481,19 @@ def download_model_action(node) -> None:
         nuke.message(f"Download failed:\n{e}")
 
 
+def clear_vram(node) -> None:
+    """Free the worker's loaded models / GPU memory ("Free VRAM" button).
+
+    The worker process stays alive, so the next inference only pays the
+    model reload — not the torch import.
+    """
+    from . import inference
+
+    inference.clear_models()
+    update_model_status(node)
+    print("[H2 SamViT] VRAM freed — model will reload on next inference.")
+
+
 def update_model_status(node) -> None:
     """Refresh the model status label based on current knob selections."""
     from . import model_manager
@@ -827,6 +840,15 @@ def run_inference(node) -> None:
         nuke.message("Enable Edit is disabled. Enable it to run inference.")
         return
 
+    # Gate: refuse cleanly if the environment/checkpoint isn't ready, instead
+    # of rendering + spawning the worker and failing (or surprise-downloading
+    # a multi-GB model) mid-flight.
+    ready, reason = inference.model_ready(node)
+    if not ready:
+        update_model_status(node)
+        nuke.message(reason)
+        return
+
     # SeC-4B is not yet integrated for inference
     family = node.knob("model_family").value()
     if family == "SEC-4B":
@@ -874,6 +896,14 @@ def process_sequence(node) -> None:
 
     if not node.knob("enable_edit").value():
         nuke.message("Enable Edit is disabled. Enable it to process.")
+        return
+
+    # Gate: same pre-flight as run_inference — a sequence run multiplies the
+    # cost of finding out late that the model isn't ready.
+    ready, reason = inference.model_ready(node)
+    if not ready:
+        update_model_status(node)
+        nuke.message(reason)
         return
 
     input_node = node.input(0)
@@ -929,15 +959,21 @@ def process_sequence(node) -> None:
 
             try:
                 if pipeline_mode == "Point / Bbox":
-                    inference.run_point_bbox_inference(
+                    outcome = inference.run_point_bbox_inference(
                         node, points, bbox, neg_bbox)
                 else:
-                    inference.run_text_prompt_inference(
+                    outcome = inference.run_text_prompt_inference(
                         node, text_prompt, points,
                     )
             except Exception as exc:
                 print(f"[H2 SamViT] Frame {frame} failed: {exc}")
                 continue
+
+            # A cancelled frame means the user wants the whole run stopped —
+            # otherwise the loop would respawn the (killed) worker and march on.
+            if outcome == "cancelled":
+                nuke.message(f"Sequence cancelled at frame {frame}.")
+                return
 
         task.setProgress(100)
         task.setMessage("Done")

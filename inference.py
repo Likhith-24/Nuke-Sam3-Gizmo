@@ -1,10 +1,21 @@
 # inference.py — SAM3/SAM2 segmentation + MatAnyone2 alpha matting engine
 #
 # Pipeline:
-#   1. SAM3 or SAM2 produces a coarse binary mask from point/box/text prompts
-#   2. MatAnyone2 refines it into production-quality soft alpha
-#   3. Post-processing (shrink/grow, feather, offset, levels)
-#   4. Mask written to gizmo's internal Read node
+#   1. Nuke renders the current frame to a temp PNG (in-process)
+#   2. worker.py — a subprocess on the plugin venv's Python — runs SAM +
+#      MatAnyone2 + mask pre/post processing and writes the mask PNG
+#   3. Temporal consistency (numpy, in-process)
+#   4. Mask written to the gizmo's internal Read node (in-process)
+#
+# WHY A SUBPROCESS: Nuke bundles its own libtorch (c10.dll / torch_cpu.dll,
+# for the Inference & CopyCat nodes), which is already resident in the
+# process. Importing pip-torch on top of it fails with WinError 1114, so
+# torch must never be imported inside Nuke. numpy / cv2 / PIL are safe.
+#
+# The nuke-free helpers in this module (finalize_mask, preprocess_mask,
+# postprocess_mask, load_text_model, select_detection_by_point,
+# _resolve_autocast_ctx) are imported and reused BY the worker — keep them
+# free of `import nuke` at module or function level.
 
 import os
 import numpy as np
@@ -35,7 +46,9 @@ def _ensure_packages():
     )
 
 
-# Global model instances (lazy loaded)
+# Global model instances — only ever populated when this module runs INSIDE
+# the worker process (load_sam_model/load_text_model must not be called from
+# Nuke; see module docstring).
 _sam_predictor = None         # SAM2ImagePredictor  or  SAM3InteractiveImagePredictor
 _sam3_model = None            # Full Sam3Image model (needed for Sam3Processor text path)
 _current_model_key = None     # (family, version, size, precision) – reload on change
@@ -88,13 +101,9 @@ def _resolve_autocast_ctx(precision: str):
 def load_sam_model(node):
     """Load the SAM model selected in the node's knobs.
 
-    For **SAM2** — builds a ``SAM2ImagePredictor`` via local YAML config.
-    For **SAM3** — builds the full ``Sam3Image`` model, then exposes
-    its ``.inst_interactive_predictor`` (``SAM3InteractiveImagePredictor``)
-    which shares the same ``set_image`` / ``predict`` API as
-    ``SAM2ImagePredictor``.
-
-    Returns the predictor (point/bbox compatible).
+    WARNING: imports torch — must only run inside the worker process. Kept
+    for legacy callers (callbacks_v3.process_sequence); the main entry
+    points below no longer use it in-process.
     """
     global _sam_predictor, _sam3_model, _current_model_key
     _ensure_packages()
@@ -181,6 +190,8 @@ def _free_models():
 def load_text_model():
     """Load text-to-detection model (Grounding DINO style).
 
+    WARNING: imports torch — worker-process only.
+
     Weights are downloaded once to ``models/grounding_dino/`` and
     loaded locally on subsequent calls — no dependency on network
     access after the initial download.
@@ -190,18 +201,18 @@ def load_text_model():
 
     if _text_model is not None:
         return _text_model
-    
+
     with _model_lock:
         if _text_model is not None:
             return _text_model
-        
+
         import torch
         from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
         from pathlib import Path
-        
+
         device = get_device()
         print(f"[H2 SamViT] Loading text detection model on {device}...")
-        
+
         model_name = "IDEA-Research/grounding-dino-base"
         cache_dir = str(
             Path(os.path.dirname(os.path.abspath(__file__)))
@@ -231,54 +242,61 @@ def load_text_model():
             "processor": processor,
             "device": device,
         }
-        
+
         _text_model["model"].eval()
-        
+
         print("[H2 SamViT] Text detection model loaded successfully.")
         return _text_model
 
 
-def image_from_nuke_node(node) -> np.ndarray:
-    """Extract the current frame from the node's input as a uint8 RGB array.
+def render_frame_to_png(node) -> str:
+    """Render the node's input at the current frame to a temp PNG.
 
-    Always renders through a temporary Write node so that **every**
-    format Nuke can decode is supported (EXR, TIFF, MOV, MP4, PNG,
-    JPG, DPX, etc.) and any upstream colour-space / transform
-    operations are baked in.
+    Returns the file path — the CALLER is responsible for deleting it.
+    Renders through a temporary Write node so every format Nuke can decode
+    is supported and upstream colour/transform ops are baked in.
     """
     import nuke
     import tempfile
-    import cv2
 
     input_node = node.input(0)
     if not input_node:
         raise ValueError("No input connected to H2_SamViT node.")
 
     frame = nuke.frame()
-
-    # Render via temp PNG — works with every format Nuke can decode.
+    # Forward slashes: Nuke file knobs mangle Windows backslashes (\t, \a …
+    # are treated as escapes), silently writing to a wrong path.
     tmp = os.path.join(
         tempfile.gettempdir(),
         f"_h2samvit_input_{os.getpid()}_{frame}.png",
-    )
+    ).replace("\\", "/")
 
     write = nuke.nodes.Write()
     write["file"].setValue(tmp)
     write["file_type"].setValue("png")
     write.setInput(0, input_node)
-
     try:
         nuke.execute(write, frame, frame)
-
-        bgr = cv2.imread(tmp, cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise RuntimeError(
-                f"Could not read the rendered frame from {tmp}"
-            )
-        print(f"[H2 SamViT] Input captured — frame {frame}")
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     finally:
         nuke.delete(write)
+
+    if not os.path.exists(tmp):
+        raise RuntimeError(f"Could not render the input frame to {tmp}")
+    print(f"[H2 SamViT] Input captured — frame {frame}")
+    return tmp
+
+
+def image_from_nuke_node(node) -> np.ndarray:
+    """Extract the current frame from the node's input as a uint8 RGB array."""
+    import cv2
+
+    tmp = render_frame_to_png(node)
+    try:
+        bgr = cv2.imread(tmp, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError(f"Could not read the rendered frame from {tmp}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    finally:
         try:
             os.remove(tmp)
         except OSError:
@@ -294,368 +312,276 @@ def refine_mask_with_matanyone2(
     return matanyone2_refiner.refine_single_frame(image, coarse_mask)
 
 
+def finalize_mask(
+    image: np.ndarray,
+    coarse_mask: np.ndarray,
+    params: Dict[str, Any],
+    use_ma2: bool,
+) -> Tuple[np.ndarray, bool]:
+    """Shared, nuke-free mask pipeline (runs inside the worker).
+
+    preprocess → optional MatAnyone2 soft-alpha refinement (else pure
+    binary) → postprocess.  Returns ``(mask, soft)`` where ``soft`` is True
+    when the mask is a soft alpha matte rather than binary.
+    """
+    while coarse_mask.ndim > 2:
+        coarse_mask = coarse_mask.squeeze(0)
+
+    coarse_mask = preprocess_mask(coarse_mask, params)
+
+    if use_ma2:
+        alpha = refine_mask_with_matanyone2(image, coarse_mask)
+
+        # Normalize: ensure the FG core reaches 1.0
+        alpha_max = float(alpha.max())
+        if 0.01 < alpha_max < 0.95:
+            alpha = np.clip(alpha / alpha_max, 0.0, 1.0)
+        else:
+            alpha = np.clip(alpha, 0.0, 1.0)
+
+        # Clean near-zero noise in definite BG areas
+        alpha[alpha < 0.004] = 0.0
+
+        # MatAnyone2 produces proper soft alpha — don't binarize
+        params = dict(params)
+        params["final_binary"] = False
+        print("[H2 SamViT] MatAnyone2 refinement applied")
+        soft = True
+    else:
+        # Pure binary mask — strictly 0.0 or 1.0
+        alpha = (coarse_mask > 0.5).astype(np.float32)
+        soft = False
+
+    return postprocess_mask(alpha, params), soft
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Worker-routed entry points (called from the gizmo's buttons)
+# ──────────────────────────────────────────────────────────────────────
+
+def model_ready(node) -> Tuple[bool, str]:
+    """Cheap pre-flight for the inference buttons. Returns (ready, reason).
+
+    Checked BEFORE Run Inference / Process Sequence does any real work, so a
+    missing environment or checkpoint refuses immediately with a clear
+    message instead of rendering the frame, spawning the worker and failing
+    (or surprise-downloading a multi-GB model) mid-flight.
+    """
+    from . import env_bootstrap, model_manager
+
+    venv = env_bootstrap.get_venv_path()
+    py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not py.exists():
+        return False, (
+            "The ML environment is not installed.\n\n"
+            f"Expected venv:\n  {venv}\n\n"
+            "Run install.py from a terminal first (see README)."
+        )
+
+    family = node.knob("model_family").value()
+    if family == "SEC-4B":
+        return False, (
+            "SeC-4B inference is not yet integrated.\n"
+            "Please use SAM2 or SAM3."
+        )
+    if family == "SAM3":
+        version, size = "3.0", "Default"
+    else:
+        version = node.knob("sam_version").value()
+        size = node.knob("model_size").value()
+
+    if not model_manager.is_downloaded(family, version, size):
+        info = model_manager.get_info(family, version, size)
+        label = f"{family} v{version} {size}" if family == "SAM2" else family
+        return False, (
+            f"{label} checkpoint is not downloaded yet "
+            f"(~{info.get('mb', '?')} MB).\n\n"
+            "Click 'Download Model' on the node first, then run inference."
+        )
+
+    return True, ""
+
+
+def _get_model_request(node) -> Dict[str, Any]:
+    """Read the model knobs; confirm a checkpoint download if needed."""
+    import nuke
+    from . import model_manager
+
+    family    = node.knob("model_family").value()
+    precision = node.knob("model_precision").value()
+    if family == "SAM3":
+        version, size = "3.0", "Default"
+    else:
+        version = node.knob("sam_version").value()
+        size    = node.knob("model_size").value()
+
+    allow_download = False
+    if not model_manager.is_downloaded(family, version, size):
+        info = model_manager.get_info(family, version, size)
+        if not info.get("url"):
+            raise FileNotFoundError(
+                "Checkpoint not found and no download URL is configured.\n"
+                f"Place it manually in:\n  {model_manager.MODELS_DIR}"
+            )
+        label = f"{family} v{version} {size}" if family == "SAM2" else family
+        if not nuke.ask(
+            f"{label} checkpoint not found.\n\n"
+            f"Download now?  (~{info['mb']} MB)\n"
+            "Progress will be printed to the terminal."
+        ):
+            raise RuntimeError("Download cancelled by user.")
+        allow_download = True
+
+    return {
+        "family": family,
+        "version": version,
+        "size": size,
+        "precision": precision,
+        "allow_download": allow_download,
+    }
+
+
+def _use_ma2(node) -> bool:
+    """Read the refinement toggle (knob name varies across gizmo versions)."""
+    for name in ("use_matanyone2", "use_vitmatte"):
+        k = node.knob(name)
+        if k is not None:
+            return bool(k.value())
+    return False
+
+
+def _read_worker_mask(path: str) -> np.ndarray:
+    """Read the worker's 16-bit grayscale mask PNG as float32 [0, 1]."""
+    import cv2
+
+    raw = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if raw is None:
+        raise RuntimeError(f"Worker produced no readable mask at {path}")
+    if raw.ndim > 2:
+        raw = raw[..., 0]
+    scale = 65535.0 if raw.dtype == np.uint16 else 255.0
+    return raw.astype(np.float32) / scale
+
+
+def _run_via_worker(node, extras: Dict[str, Any], label: str) -> None:
+    """Render the frame, run one inference in the worker, apply the mask."""
+    import nuke
+    import tempfile
+    from . import worker_client
+
+    model = _get_model_request(node)
+    params = _get_output_params(node)
+    image_path = render_frame_to_png(node)
+    mask_path = os.path.join(
+        tempfile.gettempdir(),
+        f"_h2samvit_workermask_{os.getpid()}.png",
+    )
+
+    request = {
+        "cmd": "infer",
+        "image": image_path,
+        "out_mask": mask_path,
+        "model": model,
+        "params": params,
+        "use_ma2": _use_ma2(node),
+    }
+    request.update(extras)
+
+    try:
+        resp = worker_client.request(request, label=label)
+        mask = _read_worker_mask(mask_path)
+    finally:
+        for p in (image_path, mask_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    if params.get("temporal_on", False):
+        from . import temporal
+        mask = temporal.apply_consistency(node, mask, nuke.frame(), params)
+
+    write_mask_to_node(node, mask, params)
+
+    try:
+        from . import model_manager
+        node.knob("model_status").setValue(
+            model_manager.status_text(model["family"], model["version"], model["size"])
+        )
+    except Exception:
+        pass
+
+    print(f"[H2 SamViT] {resp.get('message', 'Inference complete.')}")
+
+
 def run_point_bbox_inference(
     node,
     points: List[Dict[str, Any]],
     bbox: Optional[Tuple[float, float, float, float]],
     neg_bbox: Optional[Tuple[float, float, float, float]] = None,
-) -> None:
+) -> str:
     """Run SAM inference with points and/or bounding box prompts.
 
-    Works identically for SAM2 and SAM3 because both
-    ``SAM2ImagePredictor`` and ``SAM3InteractiveImagePredictor``
-    share the same ``set_image`` / ``predict`` API.
+    Coordinates are passed in Nuke space (bottom-left origin); the worker
+    flips them to SAM space using the rendered image height.
 
-    For SAM3 with a negative bbox: the neg bbox corners are added as
-    background (label=0) points to steer the model away from that
-    region — SAM's instance segmentation path does not natively support
-    negative boxes, but background points at the neg bbox corners
-    achieve the same effect.
-
-    Following the official SAM2/SAM3 inference pattern:
-      • ``torch.inference_mode()`` for maximum efficiency
-      • ``torch.autocast`` for mixed-precision (bf16/fp16)
-      • Model weights stay in float32 — autocast handles precision
-      • ``multimask_output`` is True for single-point prompts (ambiguous)
-        and False for multi-point or box prompts (clear intent)
+    Returns "ok", "cancelled" or "failed" — process_sequence uses this to
+    stop the whole run when the user cancels one frame.
     """
-    import torch
     import nuke
+    from . import worker_client
 
     try:
-        sam_predictor = load_sam_model(node)
-
-        image = image_from_nuke_node(node)
-
-        # Determine autocast context from the precision knob.
-        # Both SAM2 and SAM3 use the same pattern: fp32 weights + autocast.
-        precision = node.knob("model_precision").value()
-        amp_ctx = _resolve_autocast_ctx(precision)
-
-        # Image height needed to flip Y coordinates from Nuke
-        # (bottom-left origin) to SAM (top-left origin).
-        img_h = image.shape[0]
-
-        with torch.inference_mode(), amp_ctx:
-            sam_predictor.set_image(image)
-
-            # Prepare prompts
-            point_coords = None
-            point_labels = None
-            box = None
-
-            if points:
-                point_coords = np.array(
-                    [[p["x"], img_h - p["y"]] for p in points],
-                    dtype=np.float32,
-                )
-                point_labels = np.array(
-                    [p["label"] for p in points],
-                    dtype=np.int32,
-                )
-
-            if bbox:
-                x1, y1_nk, x2, y2_nk = bbox
-                box = np.array(
-                    [x1, img_h - y2_nk, x2, img_h - y1_nk],
-                    dtype=np.float32,
-                )
-
-            # Negative bbox → add its 4 corners as background points
-            # (label=0).  SAM's instance segmentation path doesn't
-            # natively support negative boxes, but background points at
-            # the corners effectively exclude that region.
-            if neg_bbox:
-                nx1, ny1_nk, nx2, ny2_nk = neg_bbox
-                neg_corners = np.array([
-                    [nx1, img_h - ny2_nk],
-                    [nx2, img_h - ny2_nk],
-                    [nx1, img_h - ny1_nk],
-                    [nx2, img_h - ny1_nk],
-                    [(nx1 + nx2) / 2, (img_h - ny2_nk + img_h - ny1_nk) / 2],
-                ], dtype=np.float32)
-                neg_labels = np.zeros(len(neg_corners), dtype=np.int32)
-
-                if point_coords is not None:
-                    point_coords = np.concatenate(
-                        [point_coords, neg_corners], axis=0)
-                    point_labels = np.concatenate(
-                        [point_labels, neg_labels], axis=0)
-                else:
-                    point_coords = neg_corners
-                    point_labels = neg_labels
-
-            # Smart multimask_output:
-            # - 1 point, no box → True  (ambiguous prompt, pick best of 3)
-            # - 2+ points or box → False (clear intent, single best mask)
-            num_prompts = (len(points) if points else 0) + (1 if bbox else 0)
-            use_multimask = num_prompts <= 1
-
-            masks, scores, logits = sam_predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box,
-                multimask_output=use_multimask,
-            )
-
-        best_idx = int(np.argmax(scores))
-        coarse_mask = masks[best_idx]
-
-        _refine_and_write(
-            node, image, coarse_mask,
-            f"Inference complete. Score: {scores[best_idx]:.3f}",
+        _run_via_worker(
+            node,
+            {
+                "mode": "point_bbox",
+                "points": points,
+                "bbox": list(bbox) if bbox else None,
+                "neg_bbox": list(neg_bbox) if neg_bbox else None,
+            },
+            label="H2 SamViT — inference",
         )
-
+        return "ok"
+    except worker_client.WorkerCancelled:
+        print("[H2 SamViT] Inference cancelled.")
+        return "cancelled"
     except Exception as e:
         import traceback
         nuke.message(f"Inference failed: {str(e)}\n\n{traceback.format_exc()}")
+        return "failed"
 
 
 def run_text_prompt_inference(
     node,
     text_prompt: str,
     selection_points: List[Dict[str, Any]]
-) -> None:
-    """Run text-based object detection + segmentation.
+) -> str:
+    """Run text-based detection + segmentation (SAM3 native / SAM2+DINO).
 
-    • **SAM3** — uses ``Sam3Processor`` (built-in text grounding via
-      CLIP language backbone).  No external detector needed.
-    • **SAM2** — falls back to Grounding DINO for detection,
-      then feeds the detected box to ``SAM2ImagePredictor``.
+    Returns "ok", "cancelled" or "failed" (see run_point_bbox_inference).
     """
-    import torch
     import nuke
-
-    family = node.knob("model_family").value()
+    from . import worker_client
 
     try:
-        if family == "SAM3":
-            _run_text_inference_sam3(node, text_prompt, selection_points)
-        else:
-            _run_text_inference_sam2(node, text_prompt, selection_points)
+        _run_via_worker(
+            node,
+            {
+                "mode": "text",
+                "text": text_prompt,
+                "selection_points": selection_points,
+            },
+            label="H2 SamViT — text inference",
+        )
+        return "ok"
+    except worker_client.WorkerCancelled:
+        print("[H2 SamViT] Inference cancelled.")
+        return "cancelled"
     except Exception as e:
         import traceback
         nuke.message(f"Text inference failed: {str(e)}\n\n{traceback.format_exc()}")
-
-
-def _run_text_inference_sam3(
-    node,
-    text_prompt: str,
-    selection_points: List[Dict[str, Any]],
-) -> None:
-    """SAM3 text-prompt inference using its built-in Sam3Processor."""
-    import torch
-    import nuke
-    from PIL import Image
-    from sam3.model.sam3_image_processor import Sam3Processor
-
-    # Ensure model is loaded (also populates _sam3_model)
-    load_sam_model(node)
-
-    if _sam3_model is None:
-        raise RuntimeError("SAM3 model is not loaded.")
-
-    image = image_from_nuke_node(node)                   # uint8 RGB np array
-    pil_image = Image.fromarray(image)
-
-    processor = Sam3Processor(_sam3_model)
-
-    # Use precision from the knob — autocast handles mixed precision.
-    precision = node.knob("model_precision").value()
-    amp_ctx = _resolve_autocast_ctx(precision)
-
-    with torch.inference_mode(), amp_ctx:
-        state  = processor.set_image(pil_image)
-        output = processor.set_text_prompt(text_prompt, state)
-
-    masks  = output["masks"]
-    scores = output["scores"]
-    boxes  = output.get("boxes", None)
-
-    if hasattr(masks, "cpu"):
-        masks = masks.cpu().float().numpy()
-    if hasattr(scores, "cpu"):
-        scores = scores.cpu().float().numpy()
-    if boxes is not None and hasattr(boxes, "cpu"):
-        boxes = boxes.cpu().float().numpy()
-
-    if len(masks) == 0:
-        nuke.message(f"No objects matching '{text_prompt}' found.")
-        return
-
-    # Select which detection to use
-    if selection_points and boxes is not None and len(boxes) > 0:
-        selected_idx = select_detection_by_point(boxes, selection_points[0])
-    else:
-        selected_idx = int(np.argmax(scores))
-
-    coarse_mask = masks[selected_idx].astype(np.float32)
-
-    while coarse_mask.ndim > 2:
-        coarse_mask = coarse_mask.squeeze(0)
-
-    # ── If the text detection found a bounding box, refine using that
-    # box as an additional SAM point/bbox prompt for better coverage ──
-    if boxes is not None and len(boxes) > 0 and _sam3_model is not None:
-        try:
-            sel_box = boxes[selected_idx]
-            predictor = _sam3_model.inst_interactive_predictor
-            sam_box = np.array([
-                sel_box[0], sel_box[1], sel_box[2], sel_box[3]
-            ])
-
-            with torch.inference_mode(), amp_ctx:
-                predictor.set_image(image)
-                refined_masks, refined_scores, _ = predictor.predict(
-                    box=sam_box,
-                    multimask_output=False,
-                )
-
-            best_refined = int(np.argmax(refined_scores))
-            refined_mask = refined_masks[best_refined].astype(np.float32)
-            while refined_mask.ndim > 2:
-                refined_mask = refined_mask.squeeze(0)
-
-            # Use refined mask if it has better coverage
-            if refined_mask.sum() > coarse_mask.sum() * 0.5:
-                coarse_mask = np.maximum(coarse_mask, refined_mask)
-                print("[H2 SamViT] Text mask refined with box prompt")
-        except Exception as e:
-            print(f"[H2 SamViT] Box refinement skipped: {e}")
-
-    # ── Shared refinement pipeline ──
-    _refine_and_write(node, image, coarse_mask,
-                      f"Text inference (SAM3) complete. "
-                      f"Found {len(masks)} objects, selected #{selected_idx + 1}")
-
-
-def _run_text_inference_sam2(
-    node,
-    text_prompt: str,
-    selection_points: List[Dict[str, Any]],
-) -> None:
-    """SAM2 text-prompt inference: Grounding DINO detection → SAM2 segmentation."""
-    import torch
-    import nuke
-
-    text_detector = load_text_model()
-    sam_predictor = load_sam_model(node)
-
-    image = image_from_nuke_node(node)
-
-    # ── Grounding DINO detection ──
-    model     = text_detector["model"]
-    processor = text_detector["processor"]
-    device    = text_detector["device"]
-
-    inputs = processor(images=image, text=text_prompt, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs["input_ids"],
-        box_threshold=0.2,
-        text_threshold=0.2,
-        target_sizes=[(image.shape[0], image.shape[1])]
-    )[0]
-
-    boxes  = results["boxes"].cpu().numpy()
-    scores = results["scores"].cpu().numpy()
-
-    if len(boxes) == 0:
-        nuke.message(f"No objects matching '{text_prompt}' found.")
-        return
-
-    if selection_points:
-        selected_idx = select_detection_by_point(boxes, selection_points[0])
-    else:
-        selected_idx = int(np.argmax(scores))
-
-    selected_box = boxes[selected_idx]
-
-    # ── SAM2 segmentation with detected box ──
-    precision = node.knob("model_precision").value()
-    amp_ctx = _resolve_autocast_ctx(precision)
-
-    with torch.inference_mode(), amp_ctx:
-        sam_predictor.set_image(image)
-
-        masks, mask_scores, logits = sam_predictor.predict(
-            box=selected_box,
-            multimask_output=False,
-        )
-
-    best_idx = int(np.argmax(mask_scores))
-    coarse_mask = masks[best_idx]
-
-    _refine_and_write(node, image, coarse_mask,
-                      f"Text inference (SAM2) complete. "
-                      f"Found {len(boxes)} objects, selected #{selected_idx + 1}")
-
-
-def _refine_and_write(
-    node,
-    image: np.ndarray,
-    coarse_mask: np.ndarray,
-    log_message: str,
-) -> None:
-    """Shared refinement / post-processing / write-back pipeline.
-
-    If MatAnyone2 is enabled, refines the coarse binary mask into a
-    soft alpha matte. Otherwise, produces a pure binary (0/1) mask.
-    """
-    import nuke
-
-    # Guarantee the mask is 2-D (H, W).
-    while coarse_mask.ndim > 2:
-        coarse_mask = coarse_mask.squeeze(0)
-
-    params = _get_output_params(node)
-
-    coarse_mask = preprocess_mask(coarse_mask, params)
-
-    # ── MatAnyone2 refinement (default ON) ──
-    use_ma2 = node.knob("use_matanyone2").value()
-
-    if use_ma2:
-        alpha_matte = refine_mask_with_matanyone2(image, coarse_mask)
-
-        # Normalize: ensure the FG core reaches 1.0
-        alpha_max = float(alpha_matte.max())
-        if 0.01 < alpha_max < 0.95:
-            alpha_matte = np.clip(alpha_matte / alpha_max, 0.0, 1.0)
-        else:
-            alpha_matte = np.clip(alpha_matte, 0.0, 1.0)
-
-        # Clean near-zero noise in definite BG areas
-        alpha_matte[alpha_matte < 0.004] = 0.0
-
-        # MatAnyone2 produces proper soft alpha — don't binarize
-        params = dict(params)
-        params["final_binary"] = False
-
-        print("[H2 SamViT] MatAnyone2 refinement applied")
-
-        # Debug: save coarse mask
-        if params.get("debug_save_coarse", False):
-            _debug_save(node, coarse_mask, "coarse")
-    else:
-        # Pure binary mask — strictly 0.0 or 1.0
-        alpha_matte = (coarse_mask > 0.5).astype(np.float32)
-
-    alpha_matte = postprocess_mask(alpha_matte, params)
-
-    if params.get("temporal_on", False):
-        from . import temporal
-        frame = nuke.frame()
-        alpha_matte = temporal.apply_consistency(node, alpha_matte, frame, params)
-
-    write_mask_to_node(node, alpha_matte, params)
-
-    print(f"[H2 SamViT] {log_message}")
+        return "failed"
 
 
 def select_detection_by_point(
@@ -664,17 +590,17 @@ def select_detection_by_point(
 ) -> int:
     """Select the detection box that contains or is closest to the point."""
     px, py = point["x"], point["y"]
-    
+
     # First, check if point is inside any box
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box
         if x1 <= px <= x2 and y1 <= py <= y2:
             return i
-    
+
     # If not inside any box, find closest box center
     centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in boxes]
     distances = [np.sqrt((c[0] - px) ** 2 + (c[1] - py) ** 2) for c in centers]
-    
+
     return int(np.argmin(distances))
 
 
@@ -803,15 +729,24 @@ def write_mask_to_node(node, mask: np.ndarray, params: Dict[str, Any]) -> None:
 
     # ── Write mask file ──
     import cv2
-    mask_dir = os.path.join(
-        tempfile.gettempdir(), "h2_samvit_masks", node_name
-    )
+    # Masks live NEXT TO THE SAVED SCRIPT so they survive temp cleanups and
+    # travel with the comp (the pattern is baked into the saved .nk via the
+    # internal Read node). Unsaved scripts fall back to %TEMP% — save before
+    # inferring if the masks need to persist.
+    script = nuke.root().name()
+    if script and script != "Root":
+        mask_root = os.path.join(os.path.dirname(script), "h2_samvit_masks")
+    else:
+        mask_root = os.path.join(tempfile.gettempdir(), "h2_samvit_masks")
+    # Forward slashes throughout: this pattern lands in a Read node's file
+    # knob, where Windows backslashes get mangled as escape sequences.
+    mask_dir = os.path.join(mask_root, node_name).replace("\\", "/")
     os.makedirs(mask_dir, exist_ok=True)
-    mask_path = os.path.join(mask_dir, f"mask.{frame:04d}.png")
+    mask_path = f"{mask_dir}/mask.{frame:04d}.png"
     mask_uint8 = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
     cv2.imwrite(mask_path, mask_uint8)
 
-    mask_pattern = os.path.join(mask_dir, "mask.####.png")
+    mask_pattern = f"{mask_dir}/mask.####.png"
 
     # ── Update gizmo internals ──
     node.begin()
@@ -866,22 +801,16 @@ def write_mask_to_node(node, mask: np.ndarray, params: Dict[str, Any]) -> None:
 
 
 def clear_models():
-    """Clear loaded models to free GPU memory."""
-    global _text_model
+    """Free the worker's models / GPU memory (and any legacy local state)."""
+    global _sam_predictor, _sam3_model, _current_model_key, _text_model
+
+    from . import worker_client
+    worker_client.clear()
 
     with _model_lock:
-        _free_models()
+        _sam_predictor = None
+        _sam3_model = None
+        _current_model_key = None
         _text_model = None
-
-    # Unload MatAnyone2
-    try:
-        from . import matanyone2_refiner
-        matanyone2_refiner.unload()
-    except Exception:
-        pass
-
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     print("[H2 SamViT] Models cleared from memory.")

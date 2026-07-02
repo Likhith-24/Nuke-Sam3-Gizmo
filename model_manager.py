@@ -263,6 +263,10 @@ def _build_sam2_from_local_config(cfg_name: str, ckpt_path: str, device):
 
     if ckpt_path:
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        # Official SAM2 checkpoints nest the weights under a "model" key
+        # (see facebookresearch/sam2 build_sam.py) — unwrap before loading.
+        if isinstance(sd, dict) and "model" in sd:
+            sd = sd["model"]
         model.load_state_dict(sd)
 
     model = model.to(device)

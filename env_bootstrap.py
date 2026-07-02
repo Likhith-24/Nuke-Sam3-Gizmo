@@ -16,15 +16,14 @@ CONFIG_FILE = PACKAGE_DIR / "env_config.json"
 
 IS_WINDOWS = platform.system() == "Windows"
 
-# On Windows, packages live in a flat target directory instead of a venv
-PYTHON_PACKAGES_DIR = PACKAGE_DIR / "python_packages"
+# Packages importable inside Nuke's process. The torch family is NOT in this
+# list on purpose: Nuke bundles its own libtorch (c10.dll — for Inference /
+# CopyCat), so importing pip-torch in-process fails with WinError 1114. All
+# torch work runs in worker.py via worker_client.py instead.
+REQUIRED_MODULES = ["numpy", "cv2", "PIL", "scipy", "psutil"]
 
-# Packages that MUST be importable for inference to work
-REQUIRED_MODULES = ["torch", "transformers", "cv2", "PIL", "scipy", "psutil", "sam2", "sam3", "einops"]
-
-# Nice-to-have but not blocking (torchvision may fail to import inside Nuke
-# due to shared-library conflicts, yet our code never imports it directly)
-OPTIONAL_MODULES = ["torchvision"]
+# Torch-family packages — verified inside the worker process, never here.
+WORKER_MODULES = ["torch", "torchvision", "transformers", "sam2", "sam3", "einops"]
 
 
 def _read_config() -> dict:
@@ -101,15 +100,6 @@ def _find_site_packages(venv_path: Path) -> list:
     return [p for p in candidates if os.path.isdir(p)]
 
 
-def _find_bin_dir(venv_path: Path) -> str:
-    """Find the bin/Scripts directory of the venv."""
-    for name in ["bin", "Scripts"]:
-        d = venv_path / name
-        if d.exists():
-            return str(d)
-    return ""
-
-
 def _inject_lib_dynload(venv_path: Path, verbose: bool = False) -> None:
     """Inject the base Python's lib-dynload into sys.path.
 
@@ -163,52 +153,39 @@ def bootstrap(verbose: bool = True) -> bool:
     site_packages: list[str] = []
     source_label = ""
 
-    # 1. Check for a virtual environment (Linux / macOS primary path)
+    # Locate the uv-managed venv (install.py creates ./venv on every platform).
     venv_path = get_venv_path()
     if venv_path.exists():
         sp = _find_site_packages(venv_path)
         site_packages.extend(sp)
         source_label = str(venv_path)
 
-    # 2. Check for a target-directory install (Windows / embedded path)
-    if PYTHON_PACKAGES_DIR.exists():
-        pkg_str = str(PYTHON_PACKAGES_DIR)
-        if pkg_str not in site_packages:
-            site_packages.append(pkg_str)
-            if not source_label:
-                source_label = pkg_str
-
     if not site_packages:
         if verbose:
-            print("[H2 SamViT] No package environment found.")
-            if IS_WINDOWS:
-                print(f"[H2 SamViT] Expected target dir: {PYTHON_PACKAGES_DIR}")
-            else:
-                print(f"[H2 SamViT] Expected venv at: {venv_path}")
-            py_cmd = "python install.py" if IS_WINDOWS else f'python3 "{PACKAGE_DIR / "install.py"}"'
-            print(f"[H2 SamViT] Run the install script first:")
-            print(f"[H2 SamViT]   {py_cmd}")
+            print(f"[H2 SamViT] No venv found at: {venv_path}")
+            print("[H2 SamViT] Run the installer first (from a terminal, not Nuke):")
+            print(f'[H2 SamViT]   cd "{PACKAGE_DIR}" && python install.py')
         return False
 
-    # Inject site-packages into sys.path (at the front so they take priority)
+    # APPEND the venv site-packages to sys.path — do not prepend. torch runs
+    # out-of-process now, so Nuke only needs the light packages (numpy, cv2,
+    # PIL, psutil) from here, and appending means Nuke's own bundled packages
+    # keep priority for every OTHER plugin in this shared .nuke; the venv only
+    # fills the gaps. (Prepending globally shadowed Nuke's numpy for the whole
+    # session — a cross-plugin hazard.)
     injected = 0
     for sp in site_packages:
         if sp not in sys.path:
-            sys.path.insert(0, sp)
+            sys.path.append(sp)
             injected += 1
             if verbose:
                 print(f"[H2 SamViT] Added to sys.path: {sp}")
 
-    # Also add the venv's bin directory to PATH for subprocess calls
+    # NOTE: this used to also prepend the venv's bin dir to PATH and set
+    # VIRTUAL_ENV. Both mutated the whole Nuke process for every other tool
+    # (and a stale VIRTUAL_ENV breaks uv-based tooling); the worker builds
+    # its own environment in worker_client, so neither is needed anymore.
     if venv_path.exists():
-        bin_dir = _find_bin_dir(venv_path)
-        if bin_dir:
-            current_path = os.environ.get("PATH", "")
-            if bin_dir not in current_path:
-                os.environ["PATH"] = bin_dir + os.pathsep + current_path
-        # Set environment variables that some packages need
-        os.environ["VIRTUAL_ENV"] = str(venv_path)
-
         # Nuke's Python may be missing C-extension modules (_lzma, etc.)
         # that live in the base Python's lib-dynload directory.
         _inject_lib_dynload(venv_path, verbose=verbose)
@@ -228,38 +205,35 @@ def check_packages(verbose: bool = True) -> dict:
     """
     results = {}
     for mod_name in REQUIRED_MODULES:
+        # Broad except: a clashing DLL raises OSError, not ImportError.
         try:
             mod = __import__(mod_name)
             version = getattr(mod, "__version__", "unknown")
             results[mod_name] = {"available": True, "version": version}
-        except ImportError:
+        except Exception:
             results[mod_name] = {"available": False, "version": None}
 
     if verbose:
-        print("[H2 SamViT] Package check:")
+        print("[H2 SamViT] Package check (in-process):")
         for name, info in results.items():
             if info["available"]:
                 print(f"  ✓ {name} ({info['version']})")
             else:
                 print(f"  ✗ {name} — NOT FOUND")
-        # Optional packages (non-blocking)
-        for mod_name in OPTIONAL_MODULES:
-            try:
-                mod = __import__(mod_name)
-                v = getattr(mod, "__version__", "unknown")
-                print(f"  ✓ {mod_name} ({v})  [optional]")
-            except ImportError:
-                print(f"  ⚠ {mod_name} — not found  [optional, non-blocking]")
+        print(
+            "[H2 SamViT] torch/sam2/sam3 run out-of-process "
+            "(verified by the inference worker)."
+        )
 
     return results
 
 
 def is_ready() -> bool:
-    """Check if all required ML packages are importable."""
+    """Check if all required in-process packages are importable."""
     for mod_name in REQUIRED_MODULES:
         try:
             __import__(mod_name)
-        except ImportError:
+        except Exception:  # OSError on DLL clashes, not just ImportError
             return False
     return True
 
@@ -267,44 +241,32 @@ def is_ready() -> bool:
 def get_status_message() -> str:
     """Get a human-readable status message for the UI."""
     venv_path = get_venv_path()
-    has_venv = venv_path.exists()
-    has_pkgdir = PYTHON_PACKAGES_DIR.exists()
-    py_cmd = "python install.py" if IS_WINDOWS else "python3 install.py"
 
-    if not has_venv and not has_pkgdir:
-        if IS_WINDOWS:
-            return (
-                f"Package environment not found.\n\n"
-                f"Expected:\n  {PYTHON_PACKAGES_DIR}\n\n"
-                f"To set up, run in a terminal:\n"
-                f"  cd \"{PACKAGE_DIR}\"\n"
-                f"  {py_cmd}"
-            )
+    if not venv_path.exists():
         return (
             f"Virtual environment not found.\n\n"
             f"Expected location:\n  {venv_path}\n\n"
-            f"To set up, run in a terminal:\n"
-            f"  cd \"{PACKAGE_DIR}\"\n"
-            f"  {py_cmd}\n\n"
+            f"To set up, run in a terminal (not inside Nuke):\n"
+            f'  cd "{PACKAGE_DIR}"\n'
+            f"  python install.py\n\n"
             f"Or set a custom path via env var:\n"
-            f"  export H2_SAMVIT_VENV=/path/to/your/venv"
+            f"  H2_SAMVIT_VENV=/path/to/your/venv"
         )
 
     missing = []
     for mod_name in REQUIRED_MODULES:
         try:
             __import__(mod_name)
-        except ImportError:
+        except Exception:
             missing.append(mod_name)
 
     if missing:
-        env_label = str(PYTHON_PACKAGES_DIR) if (has_pkgdir and not has_venv) else str(venv_path)
         return (
-            f"Environment found at:\n  {env_label}\n\n"
+            f"Environment found at:\n  {venv_path}\n\n"
             f"Missing packages: {', '.join(missing)}\n\n"
             f"To install them, run:\n"
-            f"  cd \"{PACKAGE_DIR}\"\n"
-            f"  {py_cmd}"
+            f'  cd "{PACKAGE_DIR}"\n'
+            f"  python install.py"
         )
 
     return "Environment OK — all packages available."
