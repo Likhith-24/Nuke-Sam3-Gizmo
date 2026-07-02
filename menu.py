@@ -21,3 +21,13 @@ try:
     add_h2_samvit_menu()
 except Exception as e:
     print(f"[H2_SamViT_Gizmo] Menu registration failed: {e}")
+
+# Install the viewer click handler (GUI only — this file never runs on render
+# nodes). Without it the "Place FG/BG Points" modes have no way to receive
+# viewer clicks, so no points can ever be placed.
+try:
+    from H2_SamViT_Gizmo import viewer_events
+
+    viewer_events.install()
+except Exception as e:
+    print(f"[H2_SamViT_Gizmo] Viewer click handler failed: {e}")

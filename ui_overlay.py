@@ -18,8 +18,34 @@ import os, tempfile
 from typing import Optional, Tuple
 import nuke
 
-_OVERLAY_DIR = os.path.join(tempfile.gettempdir(), "h2_samvit_overlays")
+# Forward slashes: this dir feeds Read-node file knobs, where Windows
+# backslashes are mangled as escape sequences.
+_OVERLAY_DIR = os.path.join(tempfile.gettempdir(), "h2_samvit_overlays").replace(
+    "\\", "/"
+)
 os.makedirs(_OVERLAY_DIR, exist_ok=True)
+
+# Each overlay write gets a fresh serial-numbered filename. Changing the Read
+# node's file knob is what triggers the reload — calling knob("reload")
+# .execute() from a viewer-click event raises Nuke's "I'm already executing
+# something else" alert on every placed point.
+_overlay_serial = 0
+_last_overlay_path = {}  # node name → previous file, deleted on next write
+
+
+def _overlay_path(node) -> str:
+    global _overlay_serial
+    _overlay_serial += 1
+    name = node.name()
+    old = _last_overlay_path.get(name)
+    if old:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    path = f"{_OVERLAY_DIR}/{name}_overlay_{_overlay_serial:05d}.png"
+    _last_overlay_path[name] = path
+    return path
 
 
 def _knob_rgb(node, name: str, default: Tuple[int, int, int] = (0, 255, 0)):
@@ -126,7 +152,7 @@ def render_overlay_image(node) -> Optional[str]:
         draw.line([(ix2, iy_top), (ix1, iy_bot)],
                   fill=(*neg_box_rgb, 120), width=2)
 
-    path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
+    path = _overlay_path(node)
     img.save(path, "PNG", compress_level=1)
     return path
 
@@ -143,7 +169,7 @@ def clear_overlay(node) -> None:
         w, h = fmt.width(), fmt.height()
     else:
         w, h = 4, 4
-    path = os.path.join(_OVERLAY_DIR, f"{node.name()}_overlay.png")
+    path = _overlay_path(node)
     Image.new("RGBA", (w, h), (0, 0, 0, 0)).save(path, "PNG", compress_level=1)
     _push_to_read(node, path)
 
@@ -177,10 +203,9 @@ def _push_to_read(node, path: str) -> None:
             src["after"].setValue("hold")
         except Exception:
             pass
-        try:
-            src["reload"].execute()
-        except Exception:
-            pass
+        # No knob("reload").execute() here: the serial filename change above
+        # triggers the reload, and execute() from a viewer-click event pops
+        # Nuke's "I'm already executing something else" alert.
     except Exception as e:
         print(f"[H2 SamViT] Overlay update: {e}")
 

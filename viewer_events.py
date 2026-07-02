@@ -27,10 +27,14 @@ from __future__ import annotations
 import nuke
 
 try:
-    from PySide2 import QtWidgets, QtCore
+    from PySide6 import QtWidgets, QtCore  # Nuke 16+
     _HAS_QT = True
 except ImportError:
-    _HAS_QT = False
+    try:
+        from PySide2 import QtWidgets, QtCore  # Nuke 15 and older
+        _HAS_QT = True
+    except ImportError:
+        _HAS_QT = False
 
 _handler = None  # singleton
 
@@ -101,7 +105,11 @@ class _ViewerClickHandler(QtCore.QObject):
             return False  # No mode → Nuke gets the click
 
         # ── Convert widget pos → image coords ──
-        coords = _widget_to_image(obj, event.pos(), node)
+        try:
+            local_pos = event.position().toPoint()  # Qt6
+        except AttributeError:
+            local_pos = event.pos()  # Qt5
+        coords = _widget_to_image(obj, local_pos, node)
         if coords is None:
             return False
 
@@ -211,9 +219,33 @@ def _qt_repaint():
 
 
 def _get_active_h2_node():
-    """Return the first selected H2_SamViT node with Enable Edit on."""
+    """Return the H2_SamViT node clicks should go to.
+
+    Prefers a selected node, but falls back to any node with an active
+    edit mode — clicking "Place FG Points" is a stronger signal of intent
+    than DAG selection, and requiring the node to stay selected while
+    clicking in the Viewer is an easy trap (e.g. the Viewer node being
+    the current selection silently swallowed every click).
+    """
     try:
         for n in nuke.selectedNodes():
+            ee = n.knob("enable_edit")
+            mf = n.knob("model_family")
+            if ee and mf and ee.value():
+                return n
+    except Exception:
+        pass
+
+    # Fallback: the node that entered an edit mode via a gizmo button.
+    try:
+        from H2_SamViT_Gizmo import callbacks
+
+        for fullname, mode in reversed(list(callbacks._edit_modes.items())):
+            if not mode:
+                continue
+            n = nuke.toNode(fullname)
+            if n is None:
+                continue
             ee = n.knob("enable_edit")
             mf = n.knob("model_family")
             if ee and mf and ee.value():
@@ -224,9 +256,23 @@ def _get_active_h2_node():
 
 
 def _is_viewer_gl(widget):
-    """Return True if *widget* is a Nuke Viewer's GL surface."""
+    """Return True if *widget* is a Nuke Viewer's GL surface.
+
+    Qt5 (Nuke ≤15): the GL surface wraps to Python as QGLWidget — class
+    name contains "GL".
+    Qt6 (Nuke 16): QGLWidget no longer exists, so shiboken wraps the
+    surface as a plain QWidget; the reliable marker is an ancestor whose
+    objectName is the viewer panel's node name ("Viewer.1"). Require the
+    clicked widget itself to be a large plain QWidget so clicks on the
+    viewer's toolbar buttons/sliders (also under "Viewer.1") pass through.
+    """
     cn = type(widget).__name__
-    if "GL" not in cn and "Viewport" not in cn:
+    legacy_gl = "GL" in cn or "Viewport" in cn
+    try:
+        big = widget.width() > 200 and widget.height() > 200
+    except Exception:
+        big = False
+    if not (legacy_gl or (cn == "QWidget" and big)):
         return False
 
     parent = widget.parent()
@@ -240,7 +286,7 @@ def _is_viewer_gl(widget):
             pass
         lp = pn.lower()
         lo = on.lower()
-        if "viewer" in lp or "viewer" in lo:
+        if "viewer" in lp or lo.startswith("viewer"):
             return True
         if "dag" in lp or "nodegraph" in lo:
             return False
@@ -249,7 +295,7 @@ def _is_viewer_gl(widget):
         except Exception:
             break
         depth += 1
-    return widget.width() > 200 and widget.height() > 200
+    return legacy_gl and big
 
 
 def _widget_to_image(widget, local_pos, node):

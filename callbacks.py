@@ -711,12 +711,17 @@ def _on_knob_changed_inner(node, knob) -> None:
     # ── Backward-compat: old type-6 checkbox knobs for Add FG/BG Point ──
     # If the user has a node created before the type-22 button change,
     # clicking the checkbox triggers knobChanged. Handle it here.
-    if knob_name == "add_fg_point" and knob.value():
+    # Only for actual checkbox knobs — on current gizmos these are PyScript
+    # buttons, where value() is the command string and setValue() would be
+    # setCommand() (TypeError on a bool).
+    if (knob_name == "add_fg_point" and isinstance(knob, nuke.Boolean_Knob)
+            and knob.value()):
         _place_point(node, is_foreground=True)
         knob.setValue(False)  # reset checkbox
         _try_refresh_overlay(node)
 
-    if knob_name == "add_bg_point" and knob.value():
+    if (knob_name == "add_bg_point" and isinstance(knob, nuke.Boolean_Knob)
+            and knob.value()):
         _place_point(node, is_foreground=False)
         knob.setValue(False)  # reset checkbox
         _try_refresh_overlay(node)
