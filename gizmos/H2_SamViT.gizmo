@@ -30,6 +30,7 @@ Gizmo {
  addUserKnob {26 div_run l "" +STARTLINE}
  addUserKnob {22 run_inference l "Run Inference" T "from H2_SamViT_Gizmo import callbacks; callbacks.run_inference(nuke.thisNode())" +STARTLINE}
  addUserKnob {22 process_sequence l "Process Sequence" T "from H2_SamViT_Gizmo import callbacks; callbacks.process_sequence(nuke.thisNode())" +STARTLINE}
+ addUserKnob {22 free_vram l "Free VRAM" T "from H2_SamViT_Gizmo import callbacks; callbacks.clear_vram(nuke.thisNode())" -STARTLINE}
 
  addUserKnob {20 tools_grp l "Tools" n 1}
  addUserKnob {6 enable_edit l "Enable Edit" +STARTLINE}
